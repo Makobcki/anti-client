@@ -1,0 +1,115 @@
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
+
+@dataclass
+class ToolCall:
+    """Represents a tool call requested by the model.
+    
+    Attributes:
+        id (str): A unique identifier for the tool call.
+        name (str): The name of the tool/function to call.
+        arguments (Dict[str, Any]): The arguments to pass to the tool.
+        thought_signature (Optional[str]): An optional signature representing the model's reasoning process.
+    """
+    id: str
+    name: str
+    arguments: Dict[str, Any]
+    thought_signature: Optional[str] = None
+
+@dataclass
+class Tool:
+    """Represents an executable tool that the agent can use.
+    
+    Attributes:
+        name (str): The name of the tool.
+        description (str): A description of what the tool does.
+        parameters (Dict[str, Any]): A JSON schema describing the tool's parameters.
+        func (Optional[Callable]): The actual Python function to execute.
+    """
+    name: str
+    description: str
+    parameters: Dict[str, Any]
+    func: Optional[Callable] = None
+
+@dataclass
+class Message:
+    """Represents a message in the conversation history.
+    
+    Attributes:
+        role (str): The role of the message sender (e.g., 'user', 'assistant', 'system', 'tool').
+        content (Optional[str]): The text content of the message.
+        tool_calls (Optional[List[ToolCall]]): A list of tool calls initiated in this message.
+        tool_call_id (Optional[str]): The ID of the tool call this message is responding to (if role is 'tool').
+    """
+    role: str
+    content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None
+
+@dataclass
+class UsageStats:
+    """Holds token usage statistics for a generation request.
+    
+    Attributes:
+        prompt_tokens (int): The number of tokens in the prompt.
+        completion_tokens (int): The number of tokens generated in the response.
+        total_tokens (int): The total number of tokens used.
+    """
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+@dataclass
+class ChatResponse:
+    """Represents the final response from a chat generation request.
+    
+    Attributes:
+        text (Optional[str]): The generated text content.
+        usage (UsageStats): The token usage statistics.
+        finish_reason (str): The reason the generation finished (e.g., 'STOP', 'MAX_TOKENS').
+        tool_calls (Optional[List[ToolCall]]): Any tool calls requested by the model.
+    """
+    text: Optional[str]
+    usage: UsageStats
+    finish_reason: str
+    tool_calls: Optional[List[ToolCall]] = None
+
+@dataclass
+class QuotaInfo:
+    """Contains quota information for a specific model.
+    
+    Attributes:
+        remaining_fraction (float): The remaining fraction of the quota.
+        reset_time (Optional[str]): The timestamp or description of when the quota resets.
+    """
+    remaining_fraction: float
+    reset_time: Optional[str]
+
+@dataclass
+class ModelInfo:
+    """Contains metadata and configuration for an available model.
+    
+    Attributes:
+        id (str): The identifier of the model.
+        internal_model_id (str): The internal identifier used by the API.
+        display_name (str): The human-readable name of the model.
+        model_provider (str): The provider of the model.
+        api_provider (str): The API provider backend.
+        max_tokens (int): The maximum number of total tokens supported.
+        max_output_tokens (Optional[int]): The maximum number of tokens the model can generate.
+        is_internal (bool): Whether the model is an internal-only model.
+        supports_images (bool): Whether the model supports image inputs.
+        supports_thinking (bool): Whether the model supports reasoning/thinking capabilities.
+        quota_info (Optional[QuotaInfo]): The quota information for this model, if available.
+    """
+    id: str
+    internal_model_id: str
+    display_name: str
+    model_provider: str
+    api_provider: str
+    max_tokens: int
+    max_output_tokens: Optional[int]
+    is_internal: bool
+    supports_images: bool
+    supports_thinking: bool
+    quota_info: Optional[QuotaInfo]

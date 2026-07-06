@@ -1,0 +1,188 @@
+import asyncio
+import json
+from typing import AsyncIterator, List, Optional, Union
+
+from .client import Client
+from .exceptions import AgentAPIError
+from .types import Message, Tool, ToolCall, ChatResponse
+
+class Agent:
+    """An agent that interacts with the AI model asynchronously using history and tools.
+    
+    Args:
+        client (Client): An authenticated Client instance.
+        model (str): The name of the model to use (e.g., 'gemini-3.1-pro-low').
+        name (str, optional): The name of the agent. Defaults to "Assistant".
+        system_prompt (str, optional): The system instruction prompt. Defaults to "You are a helpful assistant.".
+        tools (Optional[List[Tool]], optional): A list of tools the agent can use. Defaults to None.
+    """
+    def __init__(
+        self,
+        client: Client,
+        model: str,
+        name: str = "Assistant",
+        system_prompt: str = "You are a helpful assistant.",
+        tools: Optional[List[Tool]] = None,
+    ):
+        self.client = client
+        self.model = model
+        self.name = name
+        self.system_prompt = system_prompt
+        self.tools = tools or []
+        self._tool_map = {t.name: t for t in self.tools}
+        self.history: List[Message] = []
+
+        if self.system_prompt:
+            self.history.append(Message(role="system", content=self.system_prompt))
+
+    async def run(
+        self,
+        prompt: str,
+        temperature: float = 0.8,
+        stream: bool = False,
+        max_steps: int = 5,
+        **kwargs,
+    ) -> Union[ChatResponse, AsyncIterator[str]]:
+        """Run the agent asynchronously with a new user prompt.
+        
+        Args:
+            prompt (str): The user's input prompt.
+            temperature (float, optional): The temperature for generation. Defaults to 0.8.
+            stream (bool, optional): If True, streams the response as an async iterator. Defaults to False.
+            max_steps (int, optional): The maximum number of tool execution steps allowed. Defaults to 5.
+            **kwargs: Additional keyword arguments passed to the client's generate method.
+            
+        Returns:
+            Union[ChatResponse, AsyncIterator[str]]: A ChatResponse object if stream is False, otherwise an async iterator yielding strings.
+            
+        Raises:
+            AgentAPIError: If the maximum number of steps is exceeded while executing tools.
+        """
+        self.history.append(Message(role="user", content=prompt))
+
+        if stream:
+            return self._run_stream(temperature, max_steps, **kwargs)
+
+        for step in range(max_steps):
+            response: ChatResponse = await self.client.generate(
+                model=self.model,
+                messages=self.history,
+                temperature=temperature,
+                stream=False,
+                tools=self.tools,
+                **kwargs,
+            )
+
+            self.history.append(
+                Message(
+                    role="assistant",
+                    content=response.text,
+                    tool_calls=response.tool_calls,
+                )
+            )
+
+            if not response.tool_calls:
+                return response
+
+            for tool_call in response.tool_calls:
+                result = await self._execute_tool(tool_call)
+                self.history.append(
+                    Message(role="tool", content=result, tool_call_id=tool_call.id)
+                )
+
+        raise AgentAPIError(
+            f"Agent exceeded the maximum number of steps ({max_steps}) while executing tools."
+        )
+
+    async def _execute_tool(self, tool_call: ToolCall) -> str:
+        """Execute a requested tool call asynchronously.
+        
+        Args:
+            tool_call (ToolCall): The tool call requested by the model.
+            
+        Returns:
+            str: A JSON-encoded string containing the result or error.
+        """
+        tool = self._tool_map.get(tool_call.name)
+        if not tool:
+            return json.dumps({"error": f"Tool '{tool_call.name}' not found."})
+
+        if not tool.func:
+            return json.dumps(
+                {"error": f"Tool '{tool_call.name}' has no executable function."}
+            )
+
+        try:
+            if asyncio.iscoroutinefunction(tool.func):
+                result = await tool.func(**tool_call.arguments)
+            else:
+                result = tool.func(**tool_call.arguments)
+                
+            return (
+                json.dumps(result, ensure_ascii=False)
+                if isinstance(result, (dict, list))
+                else str(result)
+            )
+        except Exception as e:
+            return json.dumps({"error": f"Execution failed: {str(e)}"})
+
+    async def _run_stream(self, temperature: float, max_steps: int, **kwargs) -> AsyncIterator[str]:
+        """Run the agent in streaming mode asynchronously.
+        
+        Args:
+            temperature (float): The temperature for generation.
+            max_steps (int): The maximum number of tool execution steps allowed.
+            **kwargs: Additional keyword arguments.
+            
+        Yields:
+            str: Chunks of generated text.
+            
+        Raises:
+            AgentAPIError: If the maximum number of steps is exceeded while executing tools.
+        """
+        for step in range(max_steps):
+            full_text = ""
+            tool_calls = []
+            
+            stream_response = await self.client.generate(
+                model=self.model,
+                messages=self.history,
+                temperature=temperature,
+                stream=True,
+                tools=self.tools,
+                **kwargs,
+            )
+
+            async for chunk in stream_response:
+                if isinstance(chunk, list):
+                    tool_calls = chunk
+                    break
+                full_text += chunk
+                yield chunk
+
+            self.history.append(
+                Message(
+                    role="assistant",
+                    content=full_text if full_text else None,
+                    tool_calls=tool_calls if tool_calls else None
+                )
+            )
+
+            if not tool_calls:
+                return
+
+            for tool_call in tool_calls:
+                result = await self._execute_tool(tool_call)
+                self.history.append(
+                    Message(role="tool", content=result, tool_call_id=tool_call.id)
+                )
+                
+        raise AgentAPIError(
+            f"Agent exceeded the maximum number of steps ({max_steps}) while executing tools."
+        )
+
+    def clear_memory(self):
+        """Clear the conversation history, retaining only the system prompt."""
+        self.history = []
+        if self.system_prompt:
+            self.history.append(Message(role="system", content=self.system_prompt))
