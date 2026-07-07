@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import secrets
@@ -167,6 +168,8 @@ def authenticate():
 
     tokens = response.json()
     access_token = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token")
+    expires_in = tokens.get("expires_in", 3600)
 
     print("Retrieving Project ID...")
     project_response = httpx.post(
@@ -199,11 +202,33 @@ def authenticate():
         data_dir = os.path.join(home, ".anti-api")
     os.makedirs(data_dir, exist_ok=True)
 
+    import time
+    expires_at = time.time() + expires_in
+
     accounts_file = os.path.join(data_dir, "accounts.json")
+    old_refresh_token = None
+    if os.path.exists(accounts_file):
+        try:
+            with open(accounts_file, "r", encoding="utf-8") as f:
+                old_data = json.load(f)
+                old_accounts = old_data.get("accounts", [])
+                if old_accounts:
+                    old_refresh_token = old_accounts[0].get("refreshToken")
+        except Exception:
+            pass
+
+    account_info = {
+        "accessToken": access_token,
+        "projectId": project_id,
+        "expiresAt": expires_at,
+    }
+
+    saved_refresh_token = refresh_token or old_refresh_token
+    if saved_refresh_token:
+        account_info["refreshToken"] = saved_refresh_token
+
     with open(accounts_file, "w", encoding="utf-8") as f:
-        json.dump(
-            {"accounts": [{"accessToken": access_token, "projectId": project_id}]}, f
-        )
+        json.dump({"accounts": [account_info]}, f)
 
     print("Authorization completed and saved successfully!")
 
@@ -229,6 +254,8 @@ class ModelsResource:
             AgentAPIError: If the API request fails.
         """
         url = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+
+        await self._client._check_and_refresh_token()
 
         headers = {
             "Authorization": f"Bearer {self._client.api_key}",
@@ -313,13 +340,17 @@ class Client:
         """
         self.api_key = api_key or os.environ.get("MY_API_KEY")
         self.project_id = project_id
+        self.refresh_token = None
+        self.expires_at = None
 
-        if not self.api_key or not self.project_id:
-            token, proj = self._load_account_info()
-            if not self.api_key:
-                self.api_key = token
-            if not self.project_id:
-                self.project_id = proj
+        info = self._load_account_info()
+        if not self.api_key:
+            self.api_key = info.get("accessToken")
+        if not self.project_id:
+            self.project_id = info.get("projectId", "unknown")
+
+        self.refresh_token = info.get("refreshToken")
+        self.expires_at = info.get("expiresAt")
 
         if not self.api_key or self.api_key == "YOUR_ACCESS_TOKEN":
             raise AuthError(
@@ -328,11 +359,83 @@ class Client:
 
         self.models = ModelsResource(self)
 
-    def _load_account_info(self):
+    @property
+    def _lock(self):
+        if not hasattr(self, "_async_lock"):
+            self._async_lock = asyncio.Lock()
+        return self._async_lock
+
+    async def _check_and_refresh_token(self):
+        """Checks if the access token has expired and refreshes it if possible."""
+        if not self.refresh_token:
+            return
+
+        import time
+        if self.expires_at and time.time() < (self.expires_at - 60):
+            return
+
+        async with self._lock:
+            if self.expires_at and time.time() < (self.expires_at - 60):
+                return
+
+            url = OAUTH_CONFIG["token_url"]
+            data = {
+                "client_id": OAUTH_CONFIG["client_id"],
+                "client_secret": OAUTH_CONFIG["client_secret"],
+                "refresh_token": self.refresh_token,
+                "grant_type": "refresh_token",
+            }
+
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as http_client:
+                    response = await http_client.post(url, data=data)
+                
+                if response.status_code == 200:
+                    tokens = response.json()
+                    self.api_key = tokens.get("access_token")
+                    expires_in = tokens.get("expires_in", 3600)
+                    self.expires_at = time.time() + expires_in
+                    
+                    data_dir = os.environ.get("ANTI_API_DATA_DIR")
+                    if not data_dir:
+                        home = (
+                            os.environ.get("HOME")
+                            or os.environ.get("USERPROFILE")
+                            or os.path.expanduser("~")
+                        )
+                        data_dir = os.path.join(home, ".anti-api")
+                    accounts_file = os.path.join(data_dir, "accounts.json")
+                    
+                    project_id = self.project_id
+                    if os.path.exists(accounts_file):
+                        try:
+                            with open(accounts_file, "r", encoding="utf-8") as f:
+                                old_data = json.load(f)
+                                accounts = old_data.get("accounts", [])
+                                if accounts:
+                                    if not project_id or project_id == "unknown":
+                                        project_id = accounts[0].get("projectId", "unknown")
+                        except Exception:
+                            pass
+                    
+                    account_info = {
+                        "accessToken": self.api_key,
+                        "refreshToken": self.refresh_token,
+                        "projectId": project_id,
+                        "expiresAt": self.expires_at
+                    }
+                    
+                    os.makedirs(data_dir, exist_ok=True)
+                    with open(accounts_file, "w", encoding="utf-8") as f:
+                        json.dump({"accounts": [account_info]}, f)
+            except Exception:
+                pass
+
+    def _load_account_info(self) -> dict:
         """Loads account information from the local credentials file.
         
         Returns:
-            tuple: A tuple containing (access_token, project_id) or (None, None).
+            dict: The first account dict, or empty dict if not found.
         """
         data_dir = os.environ.get("ANTI_API_DATA_DIR")
         if not data_dir:
@@ -346,15 +449,16 @@ class Client:
         accounts_file = os.path.join(data_dir, "accounts.json")
 
         if os.path.exists(accounts_file):
-            with open(accounts_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                accounts = data.get("accounts", [])
-                if accounts:
-                    return accounts[0].get("accessToken"), accounts[0].get(
-                        "projectId", "unknown"
-                    )
+            try:
+                with open(accounts_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    accounts = data.get("accounts", [])
+                    if accounts:
+                        return accounts[0]
+            except Exception:
+                pass
 
-        return None, None
+        return {}
 
     async def generate(
         self,
@@ -381,6 +485,8 @@ class Client:
         Raises:
             AgentAPIError: If the generation request fails.
         """
+        await self._check_and_refresh_token()
+
         url = "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
 
         contents = []
