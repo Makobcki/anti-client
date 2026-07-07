@@ -22,8 +22,8 @@ from .types import (
 )
 
 OAUTH_CONFIG = {
-    "client_id": os.environ.get("ANTI_CLIENT_ID", ""),
-    "client_secret": os.environ.get("ANTI_CLIENT_SECRET", ""),
+    "client_id": os.environ.get("ANTI_CLIENT_ID", "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"),
+    "client_secret": os.environ.get("ANTI_CLIENT_SECRET", "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"),
     "callback_port": 51121,
     "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
     "token_url": "https://oauth2.googleapis.com/token",
