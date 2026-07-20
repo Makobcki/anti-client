@@ -500,6 +500,16 @@ class Client:
             role = "model" if msg.role == "assistant" else "user"
 
             parts = []
+            
+            if getattr(msg, "attachments", None):
+                for attachment in msg.attachments:
+                    parts.append({
+                        "inlineData": {
+                            "mimeType": attachment.mime_type,
+                            "data": attachment.data
+                        }
+                    })
+
             if msg.content:
                 parts.append({"text": msg.content})
 

@@ -32,6 +32,17 @@ class Tool:
     func: Optional[Callable] = None
 
 @dataclass
+class FileAttachment:
+    """Represents a file attachment to be sent with a message.
+    
+    Attributes:
+        mime_type (str): The MIME type of the file (e.g., 'image/png').
+        data (str): The base64-encoded string of the file's content.
+    """
+    mime_type: str
+    data: str
+
+@dataclass
 class Message:
     """Represents a message in the conversation history.
     
@@ -40,11 +51,13 @@ class Message:
         content (Optional[str]): The text content of the message.
         tool_calls (Optional[List[ToolCall]]): A list of tool calls initiated in this message.
         tool_call_id (Optional[str]): The ID of the tool call this message is responding to (if role is 'tool').
+        attachments (Optional[List[FileAttachment]]): A list of file attachments to include with the message.
     """
     role: str
     content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None
     tool_call_id: Optional[str] = None
+    attachments: Optional[List[FileAttachment]] = None
 
 @dataclass
 class UsageStats:

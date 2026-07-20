@@ -1,6 +1,6 @@
 from .client import Client, authenticate
 from .agent import Agent
-from .types import Message, Tool, ToolCall, ChatResponse, UsageStats, QuotaInfo, ModelInfo
+from .types import Message, Tool, ToolCall, ChatResponse, UsageStats, QuotaInfo, ModelInfo, FileAttachment
 from .exceptions import AgentAPIError, AuthError, ModelNotFoundError, RateLimitError, ToolExecutionError
 
 __all__ = [
@@ -8,6 +8,7 @@ __all__ = [
     "Agent",
     "authenticate",
     "Message",
+    "FileAttachment",
     "Tool",
     "ToolCall",
     "ChatResponse",
