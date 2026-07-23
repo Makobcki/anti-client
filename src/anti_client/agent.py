@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import AsyncIterator, List, Optional, Union
+from typing import Any, AsyncIterator, List, Optional, Union
 
 from .client import Client
 from .exceptions import AgentAPIError
@@ -19,7 +19,6 @@ class Agent:
         tools: Optional[List[Tool]] = None,
     ):
         """Initializes the Agent.
-
         Args:
             client (Client): An authenticated Client instance.
             model (str): The name of the model to use (e.g., 'gemini-3.1-pro-low').
@@ -46,18 +45,15 @@ class Agent:
         **kwargs,
     ) -> Union[ChatResponse, AsyncIterator[StreamChunk]]:
         """Runs the agent asynchronously with a new user prompt.
-
         Args:
             prompt (str): The user's input prompt.
             temperature (float, optional): The sampling temperature for generation. Defaults to 0.8.
             stream (bool, optional): If True, streams the response as an async iterator. Defaults to False.
             max_steps (int, optional): The maximum number of tool execution steps allowed. Defaults to 5.
             **kwargs: Additional keyword arguments passed to the client's generate method.
-
         Returns:
             Union[ChatResponse, AsyncIterator[StreamChunk]]: A ChatResponse object if stream is False,
                 otherwise an async iterator yielding StreamChunks.
-
         Raises:
             AgentAPIError: If the maximum number of steps is exceeded while executing tools.
         """
@@ -94,10 +90,8 @@ class Agent:
 
     async def _execute_tool(self, tool_call: ToolCall) -> str:
         """Executes a requested tool call asynchronously.
-
         Args:
             tool_call (ToolCall): The tool call requested by the model.
-
         Returns:
             str: A JSON-encoded string containing the result or error.
         """
@@ -112,8 +106,7 @@ class Agent:
             if asyncio.iscoroutinefunction(tool.func):
                 result = await tool.func(**tool_call.arguments)
             else:
-                result = tool.func(**tool_call.arguments)
-
+                result = await asyncio.to_thread(tool.func, **tool_call.arguments)
             return (
                 json.dumps(result, ensure_ascii=False)
                 if isinstance(result, (dict, list))
@@ -126,15 +119,12 @@ class Agent:
         self, temperature: float, max_steps: int, **kwargs
     ) -> AsyncIterator[StreamChunk]:
         """Runs the agent in streaming mode asynchronously.
-
         Args:
             temperature (float): The sampling temperature for generation.
             max_steps (int): The maximum number of tool execution steps allowed.
             **kwargs: Additional keyword arguments passed to the client generation method.
-
         Yields:
             StreamChunk: Chunks of generated text, thoughts, or tool calls.
-
         Raises:
             AgentAPIError: If the maximum number of steps is exceeded while executing tools.
         """
@@ -142,7 +132,6 @@ class Agent:
             full_text = ""
             full_thought = ""
             tool_calls = []
-
             stream_response = await self.client.generate(
                 model=self.model,
                 messages=self.history,
@@ -167,7 +156,6 @@ class Agent:
                 elif isinstance(chunk, str):
                     full_text += chunk
                     yield StreamChunk(text=chunk)
-
             self.history.append(
                 Message(
                     role="assistant",
@@ -183,10 +171,24 @@ class Agent:
                 self.history.append(
                     Message(role="tool", content=result, tool_call_id=tool_call.id)
                 )
-
         raise AgentAPIError(
             f"Agent exceeded the maximum number of steps ({max_steps}) while executing tools."
         )
+
+    async def add_mcp_tools(self, session: Any) -> List[Tool]:
+        """Loads and adds tools from an MCP (Model Context Protocol) session to the agent.
+        Args:
+            session (Any): An initialized MCP ClientSession instance.
+        Returns:
+            List[Tool]: The list of MCP tools that were added to the agent.
+        """
+        from .mcp import load_mcp_tools
+
+        mcp_tools = await load_mcp_tools(session)
+        for tool in mcp_tools:
+            self.tools.append(tool)
+            self._tool_map[tool.name] = tool
+        return mcp_tools
 
     def clear_memory(self):
         """Clears the conversation history, retaining only the system prompt."""
