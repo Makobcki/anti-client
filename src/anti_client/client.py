@@ -216,9 +216,8 @@ def authenticate():
 class ModelsResource:
     """Provides methods for querying available AI models and their quotas."""
 
-    def __init__(self, client: "Client"):
+    def __init__(self, client: Client):
         """Initializes the ModelsResource.
-
         Args:
             client (Client): The main client instance used for authentication.
         """
@@ -298,6 +297,7 @@ class Client:
         self.project_id = project_id
         self.refresh_token = None
         self.expires_at = None
+        self.http_client = httpx.AsyncClient(timeout=60.0)
         info = self._load_account_info()
         if not self.api_key:
             self.api_key = info.get("accessToken")
@@ -374,8 +374,7 @@ class Client:
                 "grant_type": "refresh_token",
             }
             try:
-                async with httpx.AsyncClient(timeout=60.0) as http_client:
-                    response = await http_client.post(url, data=data)
+                response = await self.http_client.post(url, data=data)
                 if response.status_code == 200:
                     tokens = response.json()
                     self.api_key = tokens.get("access_token")
@@ -586,26 +585,23 @@ class Client:
         }
 
         async def _do_stream() -> AsyncIterator[StreamChunk]:
-            async with httpx.AsyncClient(timeout=60.0) as http_client:
-                async with http_client.stream(
-                    "POST", url, json=payload, headers=headers
-                ) as response:
-                    if response.status_code != 200:
-                        error_text = await response.aread()
-                        raise AgentAPIError(
-                            f"Error {response.status_code}: {error_text.decode('utf-8', errors='replace')}"
-                        )
-                    async for chunk in self._stream_response(response):
-                        yield chunk
+            async with self.http_client.stream(
+                "POST", url, json=payload, headers=headers
+            ) as response:
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    self._raise_for_status(
+                        response.status_code,
+                        error_text.decode("utf-8", errors="replace"),
+                    )
+                async for chunk in self._stream_response(response):
+                    yield chunk
 
         async def _do_sync() -> ChatResponse:
-            async with httpx.AsyncClient(timeout=60.0) as http_client:
-                response = await http_client.post(url, json=payload, headers=headers)
-                if response.status_code != 200:
-                    raise AgentAPIError(
-                        f"Error {response.status_code}: {response.text}"
-                    )
-                return self._sync_response(response)
+            response = await self.http_client.post(url, json=payload, headers=headers)
+            if response.status_code != 200:
+                self._raise_for_status(response.status_code, response.text)
+            return self._sync_response(response)
 
         if stream:
             return _do_stream()
