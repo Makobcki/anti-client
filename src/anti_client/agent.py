@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import Any, AsyncIterator, List, Optional, Union
+from typing import Any, AsyncIterator, List, Literal, Optional, Union, overload
 
 from .client import Client
 from .exceptions import AgentAPIError
@@ -36,6 +36,26 @@ class Agent:
         if self.system_prompt:
             self.history.append(Message(role="system", content=self.system_prompt))
 
+    @overload
+    async def run(
+        self,
+        prompt: str,
+        temperature: float = 0.8,
+        stream: Literal[False] = False,
+        max_steps: int = 5,
+        **kwargs,
+    ) -> ChatResponse: ...
+
+    @overload
+    async def run(
+        self,
+        prompt: str,
+        temperature: float = 0.8,
+        stream: Literal[True] = True,
+        max_steps: int = 5,
+        **kwargs,
+    ) -> AsyncIterator[StreamChunk]: ...
+
     async def run(
         self,
         prompt: str,
@@ -58,8 +78,10 @@ class Agent:
             AgentAPIError: If the maximum number of steps is exceeded while executing tools.
         """
         self.history.append(Message(role="user", content=prompt))
+
         if stream:
             return self._run_stream(temperature, max_steps, **kwargs)
+
         for step in range(max_steps):
             response: ChatResponse = await self.client.generate(
                 model=self.model,
@@ -69,6 +91,7 @@ class Agent:
                 tools=self.tools,
                 **kwargs,
             )
+
             self.history.append(
                 Message(
                     role="assistant",
@@ -77,13 +100,16 @@ class Agent:
                     tool_calls=response.tool_calls,
                 )
             )
+
             if not response.tool_calls:
                 return response
+
             for tool_call in response.tool_calls:
                 result = await self._execute_tool(tool_call)
                 self.history.append(
                     Message(role="tool", content=result, tool_call_id=tool_call.id)
                 )
+
         raise AgentAPIError(
             f"Agent exceeded the maximum number of steps ({max_steps}) while executing tools."
         )

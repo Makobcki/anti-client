@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import queue
 import secrets
 import threading
 import urllib.parse
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import AsyncIterator, Dict, List, Optional, Union
+from typing import AsyncIterator, Dict, List, Literal, Optional, Union, overload
 
 import httpx
 
@@ -29,6 +31,8 @@ from .types import (
     ToolCall,
     UsageStats,
 )
+
+logger = logging.getLogger(__name__)
 
 OAUTH_CONFIG = {
     "client_id": os.environ.get(
@@ -51,10 +55,6 @@ OAUTH_CONFIG = {
     ],
 }
 
-auth_code = None
-auth_error = None
-server_ready = threading.Event()
-
 
 class OAuthCallbackHandler(BaseHTTPRequestHandler):
     """Handles the local HTTP callback for OAuth 2.0 authorization."""
@@ -62,16 +62,23 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         """Processes the GET request from the OAuth callback.
         Extracts the authorization code or error from the URL query parameters
-        and triggers the shutdown of the local HTTP server.
+        and pushes it to the server's result queue.
         """
-        global auth_code, auth_error
         parsed_path = urllib.parse.urlparse(self.path)
+
         if parsed_path.path == "/oauth-callback":
             query_params = urllib.parse.parse_qs(parsed_path.query)
+
+            # Передаем результат через очередь, привязанную к экземпляру сервера
             if "error" in query_params:
-                auth_error = query_params["error"][0]
+                self.server.oauth_result_queue.put({"error": query_params["error"][0]})
             elif "code" in query_params:
-                auth_code = query_params["code"][0]
+                self.server.oauth_result_queue.put({"code": query_params["code"][0]})
+            else:
+                self.server.oauth_result_queue.put(
+                    {"error": "No valid parameters received."}
+                )
+
             self.send_response(302)
             self.send_header("Location", "https://antigravity.google/auth-success")
             self.end_headers()
@@ -82,35 +89,8 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"Not Found")
 
     def log_message(self, format, *args):
-        """Suppresses standard HTTP server log messages.
-        Args:
-            format (str): The format string.
-            *args: Arguments to insert into the format string.
-        """
+        """Suppresses standard HTTP server log messages."""
         pass
-
-
-def start_server() -> int:
-    """Starts a local HTTP server to receive the OAuth callback.
-    Returns:
-        int: The port number the server is listening on.
-    Raises:
-        Exception: If no available port could be bound for the OAuth callback.
-    """
-    port = OAUTH_CONFIG["callback_port"]
-    max_offset = 10
-    httpd = None
-    for offset in range(max_offset + 1):
-        try:
-            httpd = HTTPServer(("127.0.0.1", port + offset), OAuthCallbackHandler)
-            break
-        except OSError:
-            continue
-    if not httpd:
-        raise Exception("Could not bind to any port for OAuth callback")
-    server_ready.set()
-    httpd.serve_forever()
-    return httpd.server_port
 
 
 def authenticate():
@@ -120,16 +100,47 @@ def authenticate():
     and refresh tokens, retrieves the user's project ID, and saves the
     credentials to `~/.anti-api/accounts.json`.
     """
-    global auth_code, auth_error
-    auth_code = None
-    auth_error = None
-    server_ready.clear()
     state = secrets.token_urlsafe(16)
+
+    result_queue = queue.Queue()
+    server_ready = threading.Event()
+    server_port_box = []
+
+    def start_server():
+        port = OAUTH_CONFIG["callback_port"]
+        max_offset = 10
+        httpd = None
+
+        for offset in range(max_offset + 1):
+            try:
+                httpd = HTTPServer(("127.0.0.1", port + offset), OAuthCallbackHandler)
+                break
+            except OSError:
+                continue
+
+        if not httpd:
+            result_queue.put({"error": "Could not bind to any port for OAuth callback"})
+            server_ready.set()
+            return
+
+        httpd.oauth_result_queue = result_queue
+        server_port_box.append(httpd.server_port)
+
+        server_ready.set()
+        httpd.serve_forever()
+
     server_thread = threading.Thread(target=start_server)
     server_thread.daemon = True
     server_thread.start()
     server_ready.wait()
-    redirect_uri = f"http://localhost:{OAUTH_CONFIG['callback_port']}/oauth-callback"
+
+    if not server_port_box:
+        print("Failed to start the local HTTP server.")
+        return
+
+    actual_port = server_port_box[0]
+    redirect_uri = f"http://localhost:{actual_port}/oauth-callback"
+
     params = {
         "client_id": OAUTH_CONFIG["client_id"],
         "redirect_uri": redirect_uri,
@@ -139,19 +150,32 @@ def authenticate():
         "prompt": "consent",
         "state": state,
     }
+
     auth_url = f"{OAUTH_CONFIG['auth_url']}?{urllib.parse.urlencode(params)}"
     print(
         f"Opening browser for authorization...\nIf the browser does not open automatically, please visit:\n{auth_url}\n"
     )
     webbrowser.open(auth_url)
-    server_thread.join(timeout=300)
+
+    try:
+        result = result_queue.get(timeout=300)
+    except queue.Empty:
+        print("Authorization timed out.")
+        return
+
+    auth_error = result.get("error")
+    auth_code = result.get("code")
+
     if auth_error:
         print(f"Authorization error: {auth_error}")
         return
+
     if not auth_code:
         print("Authorization was not completed.")
         return
+
     print("Authorization code received. Exchanging for tokens...")
+
     token_data = {
         "code": auth_code,
         "client_id": OAUTH_CONFIG["client_id"],
@@ -159,14 +183,17 @@ def authenticate():
         "redirect_uri": redirect_uri,
         "grant_type": "authorization_code",
     }
+
     response = httpx.post(OAUTH_CONFIG["token_url"], data=token_data, timeout=60.0)
     if response.status_code != 200:
         print(f"Token exchange error: {response.status_code}\n{response.text}")
         return
+
     tokens = response.json()
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token")
     expires_in = tokens.get("expires_in", 3600)
+
     print("Retrieving Project ID...")
     project_response = httpx.post(
         OAUTH_CONFIG["project_url"],
@@ -178,6 +205,7 @@ def authenticate():
         json={"metadata": {"ideType": "ANTIGRAVITY"}},
         timeout=60.0,
     )
+
     project_id = "unknown"
     if project_response.status_code == 200:
         project_data = project_response.json()
@@ -188,6 +216,7 @@ def authenticate():
             project_id = raw_project
         else:
             project_id = "unknown"
+
     data_dir = os.environ.get("ANTI_API_DATA_DIR")
     if not data_dir:
         home = (
@@ -196,11 +225,14 @@ def authenticate():
             or os.path.expanduser("~")
         )
         data_dir = os.path.join(home, ".anti-api")
+
     os.makedirs(data_dir, exist_ok=True)
+
     import time
 
     expires_at = time.time() + expires_in
     accounts_file = os.path.join(data_dir, "accounts.json")
+
     account_info = {
         "accessToken": access_token,
         "projectId": project_id,
@@ -208,8 +240,10 @@ def authenticate():
     }
     if refresh_token:
         account_info["refreshToken"] = refresh_token
+
     with open(accounts_file, "w", encoding="utf-8") as f:
         json.dump({"accounts": [account_info]}, f)
+
     print("Authorization completed and saved successfully!")
 
 
@@ -451,6 +485,28 @@ class Client:
             return part["text"], None
         return None, None
 
+    @overload
+    async def generate(
+        self,
+        model: str,
+        messages: List[Message],
+        temperature: float = 0.8,
+        stream: Literal[False] = False,
+        tools: Optional[List[Tool]] = None,
+        **kwargs,
+    ) -> ChatResponse: ...
+
+    @overload
+    async def generate(
+        self,
+        model: str,
+        messages: List[Message],
+        temperature: float = 0.8,
+        stream: Literal[True] = True,
+        tools: Optional[List[Tool]] = None,
+        **kwargs,
+    ) -> AsyncIterator[StreamChunk]: ...
+
     async def generate(
         self,
         model: str,
@@ -620,6 +676,7 @@ class Client:
         tool_calls = []
         finish_reason = "stop"
         usage = UsageStats(0, 0, 0)
+
         for line_str in response.iter_lines():
             if line_str:
                 if line_str.startswith("data: "):
@@ -641,6 +698,7 @@ class Client:
                                     ),
                                     total_tokens=meta.get("totalTokenCount", 0),
                                 )
+
                             candidates = resp.get("candidates", [])
                             for candidate in candidates:
                                 if "finishReason" in candidate:
@@ -665,7 +723,8 @@ class Client:
                                             )
                                         )
                     except json.JSONDecodeError:
-                        pass
+                        logger.warning("Failed to decode chunk: %s", data_str)
+
         return ChatResponse(
             text=full_text if full_text else None,
             thought=full_thought if full_thought else None,
@@ -684,6 +743,7 @@ class Client:
             StreamChunk: Chunks of generated text, thoughts, or a list of tool calls.
         """
         tool_calls = []
+
         async for line_str in response.aiter_lines():
             if line_str:
                 if line_str.startswith("data: "):
@@ -717,6 +777,7 @@ class Client:
                                             )
                                         )
                     except json.JSONDecodeError:
-                        pass
+                        logger.warning("Failed to decode chunk: %s", data_str)
+
         if tool_calls:
             yield StreamChunk(tool_calls=tool_calls)

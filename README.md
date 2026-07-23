@@ -20,12 +20,10 @@ pip install .
 ## Usage Example
 
 ```python
+import asyncio
 from anti_client import Client, Agent, Tool
 
-# 1. Initialize Client (Triggers OAuth flow if tokens are missing)
-client = Client()
-
-# 2. Define Tools
+# 1. Define Tools
 def get_weather(city: str) -> str:
     """Retrieve weather information for a specific city."""
     return f"The weather in {city} is clear and sunny."
@@ -43,18 +41,26 @@ weather_tool = Tool(
     func=get_weather
 )
 
-# 3. Initialize Agent
-agent = Agent(
-    client=client,
-    model="gemini-3.1-pro-low",
-    system_prompt="You are a helpful assistant.",
-    tools=[weather_tool]
-)
+async def main():
+    # 2. Initialize Client using an async context manager
+    # (Triggers OAuth flow if tokens are missing)
+    async with Client() as client:
 
-# 4. Generate Response
-response = agent.run("Hello! What's the weather like in London?")
+        # 3. Initialize Agent
+        agent = Agent(
+            client=client,
+            model="gemini-3.1-pro-low",
+            system_prompt="You are a helpful assistant.",
+            tools=[weather_tool]
+        )
 
-if not isinstance(response, type((x for x in []))): # If stream=False
-    print("Response:", response.text)
-    print("Tokens Used:", response.usage.total_tokens)
+        # 4. Generate Response
+        response = await agent.run("Hello! What's the weather like in London?", stream=False)
+
+        print("Response:", response.text)
+        print("Tokens Used:", response.usage.total_tokens)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
 ```
