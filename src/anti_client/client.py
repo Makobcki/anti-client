@@ -13,7 +13,12 @@ from typing import AsyncIterator, Dict, List, Optional, Union
 
 import httpx
 
-from .exceptions import AgentAPIError, AuthError
+from .exceptions import (
+    AgentAPIError,
+    AuthError,
+    ModelNotFoundError,
+    RateLimitError,
+)
 from .types import (
     ChatResponse,
     Message,
@@ -56,7 +61,6 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         """Processes the GET request from the OAuth callback.
-
         Extracts the authorization code or error from the URL query parameters
         and triggers the shutdown of the local HTTP server.
         """
@@ -79,7 +83,6 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         """Suppresses standard HTTP server log messages.
-
         Args:
             format (str): The format string.
             *args: Arguments to insert into the format string.
@@ -89,10 +92,8 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
 
 def start_server() -> int:
     """Starts a local HTTP server to receive the OAuth callback.
-
     Returns:
         int: The port number the server is listening on.
-
     Raises:
         Exception: If no available port could be bound for the OAuth callback.
     """
@@ -114,7 +115,6 @@ def start_server() -> int:
 
 def authenticate():
     """Authenticates the user via Google OAuth 2.0.
-
     Starts a local server, opens the user's browser for authorization,
     waits for the OAuth callback, exchanges the authorization code for access
     and refresh tokens, retrieves the user's project ID, and saves the
@@ -226,10 +226,8 @@ class ModelsResource:
 
     async def list(self) -> List[ModelInfo]:
         """Fetches a list of all available models asynchronously.
-
         Returns:
             List[ModelInfo]: A list of available models and their metadata.
-
         Raises:
             AgentAPIError: If the API request to fetch models fails.
         """
@@ -241,12 +239,9 @@ class ModelsResource:
             "User-Agent": "antigravity/2.3.0 macos/arm64",
         }
         data = {"project": self._client.project_id}
-        async with httpx.AsyncClient(timeout=60.0) as http_client:
-            response = await http_client.post(url, json=data, headers=headers)
+        response = await self._client.http_client.post(url, json=data, headers=headers)
         if response.status_code != 200:
-            raise AgentAPIError(
-                f"Error fetching models {response.status_code}: {response.text}"
-            )
+            Client._raise_for_status(response.status_code, response.text)
         response_data = response.json()
         models_dict = response_data.get("models", {})
         parsed_models = []
@@ -279,7 +274,6 @@ class ModelsResource:
 
     async def get(self) -> Dict[str, QuotaInfo]:
         """Gets a mapping of model IDs to their quota information asynchronously.
-
         Returns:
             Dict[str, QuotaInfo]: A dictionary mapping model IDs to their quotas.
         """
@@ -292,14 +286,11 @@ class Client:
 
     def __init__(self, api_key: Optional[str] = None, project_id: Optional[str] = None):
         """Initializes the client.
-
         If `api_key` or `project_id` are not provided, it will attempt to load
         them from the local cache file or environment variables.
-
         Args:
             api_key (Optional[str], optional): The OAuth access token. Defaults to None.
             project_id (Optional[str], optional): The Google Cloud project ID. Defaults to None.
-
         Raises:
             AuthError: If authentication tokens or the project ID are missing.
         """
@@ -320,10 +311,43 @@ class Client:
             raise AuthError("Google Cloud Project ID is unknown.")
         self.models = ModelsResource(self)
 
+    async def close(self) -> None:
+        """Closes the underlying HTTP client session."""
+        await self.http_client.aclose()
+
+    async def __aenter__(self) -> Client:
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.close()
+
+    @staticmethod
+    def _raise_for_status(status_code: int, error_text: str) -> None:
+        """Raises a specific custom exception based on the HTTP status code.
+
+        Args:
+            status_code (int): The HTTP status code returned by the API.
+            error_text (str): The error response body text.
+
+        Raises:
+            AuthError: If status code is 401.
+            ModelNotFoundError: If status code is 404.
+            RateLimitError: If status code is 429.
+            AgentAPIError: For any other non-200 status code.
+        """
+        if status_code == 200:
+            return
+        if status_code == 401:
+            raise AuthError(f"Unauthorized (401): {error_text}")
+        if status_code == 404:
+            raise ModelNotFoundError(f"Model or resource not found (404): {error_text}")
+        if status_code == 429:
+            raise RateLimitError(f"Rate limit exceeded (429): {error_text}")
+        raise AgentAPIError(f"Error {status_code}: {error_text}")
+
     @property
     def _lock(self):
         """Returns the asyncio Lock, creating it if it doesn't exist yet.
-
         Returns:
             asyncio.Lock: The lock used to prevent race conditions during token refresh.
         """
@@ -380,7 +404,6 @@ class Client:
 
     def _load_account_info(self) -> dict:
         """Loads account information from the local credentials file.
-
         Returns:
             dict: The first account dictionary, or an empty dictionary if not found.
         """
@@ -407,10 +430,8 @@ class Client:
     @staticmethod
     def _parse_part(part: dict) -> tuple[Optional[str], Optional[str]]:
         """Extracts text and thought content from a candidate content part.
-
         Args:
             part (dict): The dictionary representation of a content part.
-
         Returns:
             tuple[Optional[str], Optional[str]]: A tuple containing the text
                 and the thought content, respectively. Either or both can be None.
@@ -421,17 +442,14 @@ class Client:
                 part.get("thought") if isinstance(part.get("thought"), str) else None
             )
             return None, thought_text
-
         if (
             "thought" in part
             and isinstance(part["thought"], str)
             and "text" not in part
         ):
             return None, part["thought"]
-
         if "text" in part:
             return part["text"], None
-
         return None, None
 
     async def generate(
@@ -444,7 +462,6 @@ class Client:
         **kwargs,
     ) -> Union[ChatResponse, AsyncIterator[StreamChunk]]:
         """Generates a response from the model asynchronously.
-
         Args:
             model (str): The ID of the model to use for generation.
             messages (List[Message]): The conversation history.
@@ -452,11 +469,9 @@ class Client:
             stream (bool, optional): Whether to stream the response. Defaults to False.
             tools (Optional[List[Tool]], optional): A list of tools available to the model. Defaults to None.
             **kwargs: Additional generation parameters.
-
         Returns:
             Union[ChatResponse, AsyncIterator[StreamChunk]]: A complete ChatResponse if stream
                 is False, or an async iterator yielding StreamChunks if stream is True.
-
         Raises:
             AgentAPIError: If the generation API request fails.
         """
@@ -599,10 +614,8 @@ class Client:
 
     def _sync_response(self, response: httpx.Response) -> ChatResponse:
         """Parses a synchronous (non-streaming) response from the API.
-
         Args:
             response (httpx.Response): The raw HTTP response object.
-
         Returns:
             ChatResponse: The fully parsed response containing text, thoughts, usage, and tool calls.
         """
@@ -669,10 +682,8 @@ class Client:
         self, response: httpx.Response
     ) -> AsyncIterator[StreamChunk]:
         """Parses an async streaming response from the API.
-
         Args:
             response (httpx.Response): The raw HTTP response object.
-
         Yields:
             StreamChunk: Chunks of generated text, thoughts, or a list of tool calls.
         """
