@@ -1,7 +1,23 @@
-from .client import Client, authenticate
 from .agent import Agent
-from .types import Message, Tool, ToolCall, ChatResponse, UsageStats, QuotaInfo, ModelInfo, FileAttachment
-from .exceptions import AgentAPIError, AuthError, ModelNotFoundError, RateLimitError, ToolExecutionError
+from .client import Client, authenticate
+from .exceptions import (
+    AgentAPIError,
+    AuthError,
+    ModelNotFoundError,
+    RateLimitError,
+    ToolExecutionError,
+)
+from .types import (
+    ChatResponse,
+    FileAttachment,
+    Message,
+    ModelInfo,
+    QuotaInfo,
+    StreamChunk,
+    Tool,
+    ToolCall,
+    UsageStats,
+)
 
 __all__ = [
     "Client",
@@ -12,6 +28,7 @@ __all__ = [
     "Tool",
     "ToolCall",
     "ChatResponse",
+    "StreamChunk",
     "UsageStats",
     "QuotaInfo",
     "ModelInfo",

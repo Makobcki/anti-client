@@ -17,6 +17,7 @@ from .types import (
     Message,
     ModelInfo,
     QuotaInfo,
+    StreamChunk,
     Tool,
     ToolCall,
     UsageStats,
@@ -49,25 +50,25 @@ server_ready = threading.Event()
 
 
 class OAuthCallbackHandler(BaseHTTPRequestHandler):
-    """Handles the OAuth callback redirect locally."""
+    """Handles the local HTTP callback for OAuth 2.0 authorization."""
 
     def do_GET(self):
-        """Processes the GET request for the OAuth callback."""
+        """Processes the GET request from the OAuth callback.
+
+        Extracts the authorization code or error from the URL query parameters
+        and triggers the shutdown of the local HTTP server.
+        """
         global auth_code, auth_error
         parsed_path = urllib.parse.urlparse(self.path)
-
         if parsed_path.path == "/oauth-callback":
             query_params = urllib.parse.parse_qs(parsed_path.query)
-
             if "error" in query_params:
                 auth_error = query_params["error"][0]
             elif "code" in query_params:
                 auth_code = query_params["code"][0]
-
             self.send_response(302)
             self.send_header("Location", "https://antigravity.google/auth-success")
             self.end_headers()
-
             threading.Thread(target=self.server.shutdown).start()
         else:
             self.send_response(404)
@@ -75,33 +76,35 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"Not Found")
 
     def log_message(self, format, *args):
-        """Suppress standard log messages."""
+        """Suppresses standard HTTP server log messages.
+
+        Args:
+            format (str): The format string.
+            *args: Arguments to insert into the format string.
+        """
         pass
 
 
 def start_server() -> int:
-    """Starts the local HTTP server to receive the OAuth callback.
+    """Starts a local HTTP server to receive the OAuth callback.
 
     Returns:
         int: The port number the server is listening on.
 
     Raises:
-        Exception: If no available port could be bound.
+        Exception: If no available port could be bound for the OAuth callback.
     """
     port = OAUTH_CONFIG["callback_port"]
     max_offset = 10
     httpd = None
-
     for offset in range(max_offset + 1):
         try:
             httpd = HTTPServer(("127.0.0.1", port + offset), OAuthCallbackHandler)
             break
         except OSError:
             continue
-
     if not httpd:
         raise Exception("Could not bind to any port for OAuth callback")
-
     server_ready.set()
     httpd.serve_forever()
     return httpd.server_port
@@ -110,24 +113,21 @@ def start_server() -> int:
 def authenticate():
     """Authenticates the user via Google OAuth 2.0.
 
-    This function starts a local server, opens the user's browser, waits for the OAuth
-    callback, exchanges the code for tokens, retrieves the project ID, and saves the
-    authentication data to `~/.anti-api/accounts.json`.
+    Starts a local server, opens the user's browser for authorization,
+    waits for the OAuth callback, exchanges the authorization code for access
+    and refresh tokens, retrieves the user's project ID, and saves the
+    credentials to `~/.anti-api/accounts.json`.
     """
     global auth_code, auth_error
     auth_code = None
     auth_error = None
     server_ready.clear()
-
     state = secrets.token_urlsafe(16)
-
     server_thread = threading.Thread(target=start_server)
     server_thread.daemon = True
     server_thread.start()
-
     server_ready.wait()
     redirect_uri = f"http://localhost:{OAUTH_CONFIG['callback_port']}/oauth-callback"
-
     params = {
         "client_id": OAUTH_CONFIG["client_id"],
         "redirect_uri": redirect_uri,
@@ -137,26 +137,19 @@ def authenticate():
         "prompt": "consent",
         "state": state,
     }
-
     auth_url = f"{OAUTH_CONFIG['auth_url']}?{urllib.parse.urlencode(params)}"
-
     print(
         f"Opening browser for authorization...\nIf the browser does not open automatically, please visit:\n{auth_url}\n"
     )
     webbrowser.open(auth_url)
-
     server_thread.join(timeout=300)
-
     if auth_error:
         print(f"Authorization error: {auth_error}")
         return
-
     if not auth_code:
         print("Authorization was not completed.")
         return
-
     print("Authorization code received. Exchanging for tokens...")
-
     token_data = {
         "code": auth_code,
         "client_id": OAUTH_CONFIG["client_id"],
@@ -164,17 +157,14 @@ def authenticate():
         "redirect_uri": redirect_uri,
         "grant_type": "authorization_code",
     }
-
     response = httpx.post(OAUTH_CONFIG["token_url"], data=token_data, timeout=60.0)
     if response.status_code != 200:
         print(f"Token exchange error: {response.status_code}\n{response.text}")
         return
-
     tokens = response.json()
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token")
     expires_in = tokens.get("expires_in", 3600)
-
     print("Retrieving Project ID...")
     project_response = httpx.post(
         OAUTH_CONFIG["project_url"],
@@ -186,7 +176,6 @@ def authenticate():
         json={"metadata": {"ideType": "ANTIGRAVITY"}},
         timeout=60.0,
     )
-
     project_id = "unknown"
     if project_response.status_code == 200:
         project_data = project_response.json()
@@ -197,16 +186,6 @@ def authenticate():
             project_id = raw_project
         else:
             project_id = "unknown"
-
-        if project_id == "unknown":
-            print(
-                "Warning: Could not extract a valid Project ID from authorization response."
-            )
-    else:
-        print(
-            f"Failed to get Project ID: {project_response.status_code}\n{project_response.text}"
-        )
-
     data_dir = os.environ.get("ANTI_API_DATA_DIR")
     if not data_dir:
         home = (
@@ -216,47 +195,30 @@ def authenticate():
         )
         data_dir = os.path.join(home, ".anti-api")
     os.makedirs(data_dir, exist_ok=True)
-
     import time
 
     expires_at = time.time() + expires_in
-
     accounts_file = os.path.join(data_dir, "accounts.json")
-    old_refresh_token = None
-    if os.path.exists(accounts_file):
-        try:
-            with open(accounts_file, "r", encoding="utf-8") as f:
-                old_data = json.load(f)
-                old_accounts = old_data.get("accounts", [])
-                if old_accounts:
-                    old_refresh_token = old_accounts[0].get("refreshToken")
-        except Exception:
-            pass
-
     account_info = {
         "accessToken": access_token,
         "projectId": project_id,
         "expiresAt": expires_at,
     }
-
-    saved_refresh_token = refresh_token or old_refresh_token
-    if saved_refresh_token:
-        account_info["refreshToken"] = saved_refresh_token
-
+    if refresh_token:
+        account_info["refreshToken"] = refresh_token
     with open(accounts_file, "w", encoding="utf-8") as f:
         json.dump({"accounts": [account_info]}, f)
-
     print("Authorization completed and saved successfully!")
 
 
 class ModelsResource:
-    """Provides methods for querying available models."""
+    """Provides methods for querying available AI models and their quotas."""
 
     def __init__(self, client: "Client"):
-        """Initializes the ModelsResource with a client.
+        """Initializes the ModelsResource.
 
         Args:
-            client (Client): The main client instance.
+            client (Client): The main client instance used for authentication.
         """
         self._client = client
 
@@ -267,31 +229,24 @@ class ModelsResource:
             List[ModelInfo]: A list of available models and their metadata.
 
         Raises:
-            AgentAPIError: If the API request fails.
+            AgentAPIError: If the API request to fetch models fails.
         """
         url = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
-
         await self._client._check_and_refresh_token()
-
         headers = {
             "Authorization": f"Bearer {self._client.api_key}",
             "Content-Type": "application/json",
             "User-Agent": "antigravity/2.3.0 macos/arm64",
         }
-
         data = {"project": self._client.project_id}
-
         async with httpx.AsyncClient(timeout=60.0) as http_client:
             response = await http_client.post(url, json=data, headers=headers)
-
         if response.status_code != 200:
             raise AgentAPIError(
                 f"Error fetching models {response.status_code}: {response.text}"
             )
-
         response_data = response.json()
         models_dict = response_data.get("models", {})
-
         parsed_models = []
         for name, info in models_dict.items():
             quota_raw = info.get("quotaInfo", {})
@@ -303,7 +258,6 @@ class ModelsResource:
                 if quota_raw
                 else None
             )
-
             parsed_models.append(
                 ModelInfo(
                     id=name,
@@ -319,11 +273,10 @@ class ModelsResource:
                     quota_info=quota_info,
                 )
             )
-
         return parsed_models
 
     async def get(self) -> Dict[str, QuotaInfo]:
-        """Gets a mapping of model IDs to their quota info asynchronously.
+        """Gets a mapping of model IDs to their quota information asynchronously.
 
         Returns:
             Dict[str, QuotaInfo]: A dictionary mapping model IDs to their quotas.
@@ -333,53 +286,45 @@ class ModelsResource:
 
 
 class Client:
-    """The main async client for interacting with the Cloud Code (Gemini) API.
-
-    Attributes:
-        api_key (str): The OAuth access token.
-        project_id (str): The Google Cloud project ID.
-        models (ModelsResource): Resource for interacting with models.
-    """
+    """The main async client for interacting with the Cloud Code (Gemini) API."""
 
     def __init__(self, api_key: Optional[str] = None, project_id: Optional[str] = None):
         """Initializes the client.
 
-        If `api_key` or `project_id` are not provided, it will attempt to load them from
-        the local cache file or environment variables.
+        If `api_key` or `project_id` are not provided, it will attempt to load
+        them from the local cache file or environment variables.
 
         Args:
             api_key (Optional[str], optional): The OAuth access token. Defaults to None.
             project_id (Optional[str], optional): The Google Cloud project ID. Defaults to None.
 
         Raises:
-            AuthError: If authentication tokens are missing.
+            AuthError: If authentication tokens or the project ID are missing.
         """
         self.api_key = api_key or os.environ.get("MY_API_KEY")
         self.project_id = project_id
         self.refresh_token = None
         self.expires_at = None
-
         info = self._load_account_info()
         if not self.api_key:
             self.api_key = info.get("accessToken")
         if not self.project_id:
             self.project_id = info.get("projectId", "unknown")
-
         self.refresh_token = info.get("refreshToken")
         self.expires_at = info.get("expiresAt")
-
         if not self.api_key or self.api_key == "YOUR_ACCESS_TOKEN":
             raise AuthError("API key not provided. Run anti_client.authenticate()")
-
         if not self.project_id or self.project_id == "unknown":
-            raise AuthError(
-                "Google Cloud Project ID is unknown. Please run anti_client.authenticate() or initialize Client with a valid project_id (e.g. Client(project_id='your-project-id'))."
-            )
-
+            raise AuthError("Google Cloud Project ID is unknown.")
         self.models = ModelsResource(self)
 
     @property
     def _lock(self):
+        """Returns the asyncio Lock, creating it if it doesn't exist yet.
+
+        Returns:
+            asyncio.Lock: The lock used to prevent race conditions during token refresh.
+        """
         if not hasattr(self, "_async_lock"):
             self._async_lock = asyncio.Lock()
         return self._async_lock
@@ -388,16 +333,13 @@ class Client:
         """Checks if the access token has expired and refreshes it if possible."""
         if not self.refresh_token:
             return
-
         import time
 
         if self.expires_at and time.time() < (self.expires_at - 60):
             return
-
         async with self._lock:
             if self.expires_at and time.time() < (self.expires_at - 60):
                 return
-
             url = OAUTH_CONFIG["token_url"]
             data = {
                 "client_id": OAUTH_CONFIG["client_id"],
@@ -405,17 +347,14 @@ class Client:
                 "refresh_token": self.refresh_token,
                 "grant_type": "refresh_token",
             }
-
             try:
                 async with httpx.AsyncClient(timeout=60.0) as http_client:
                     response = await http_client.post(url, data=data)
-
                 if response.status_code == 200:
                     tokens = response.json()
                     self.api_key = tokens.get("access_token")
                     expires_in = tokens.get("expires_in", 3600)
                     self.expires_at = time.time() + expires_in
-
                     data_dir = os.environ.get("ANTI_API_DATA_DIR")
                     if not data_dir:
                         home = (
@@ -425,28 +364,12 @@ class Client:
                         )
                         data_dir = os.path.join(home, ".anti-api")
                     accounts_file = os.path.join(data_dir, "accounts.json")
-
-                    project_id = self.project_id
-                    if os.path.exists(accounts_file):
-                        try:
-                            with open(accounts_file, "r", encoding="utf-8") as f:
-                                old_data = json.load(f)
-                                accounts = old_data.get("accounts", [])
-                                if accounts:
-                                    if not project_id or project_id == "unknown":
-                                        project_id = accounts[0].get(
-                                            "projectId", "unknown"
-                                        )
-                        except Exception:
-                            pass
-
                     account_info = {
                         "accessToken": self.api_key,
                         "refreshToken": self.refresh_token,
-                        "projectId": project_id,
+                        "projectId": self.project_id,
                         "expiresAt": self.expires_at,
                     }
-
                     os.makedirs(data_dir, exist_ok=True)
                     with open(accounts_file, "w", encoding="utf-8") as f:
                         json.dump({"accounts": [account_info]}, f)
@@ -457,7 +380,7 @@ class Client:
         """Loads account information from the local credentials file.
 
         Returns:
-            dict: The first account dict, or empty dict if not found.
+            dict: The first account dictionary, or an empty dictionary if not found.
         """
         data_dir = os.environ.get("ANTI_API_DATA_DIR")
         if not data_dir:
@@ -467,9 +390,7 @@ class Client:
                 or os.path.expanduser("~")
             )
             data_dir = os.path.join(home, ".anti-api")
-
         accounts_file = os.path.join(data_dir, "accounts.json")
-
         if os.path.exists(accounts_file):
             try:
                 with open(accounts_file, "r", encoding="utf-8") as f:
@@ -479,8 +400,37 @@ class Client:
                         return accounts[0]
             except Exception:
                 pass
-
         return {}
+
+    @staticmethod
+    def _parse_part(part: dict) -> tuple[Optional[str], Optional[str]]:
+        """Extracts text and thought content from a candidate content part.
+
+        Args:
+            part (dict): The dictionary representation of a content part.
+
+        Returns:
+            tuple[Optional[str], Optional[str]]: A tuple containing the text
+                and the thought content, respectively. Either or both can be None.
+        """
+        is_thought = part.get("thought") is True or part.get("isThought") is True
+        if is_thought:
+            thought_text = part.get("text") or (
+                part.get("thought") if isinstance(part.get("thought"), str) else None
+            )
+            return None, thought_text
+
+        if (
+            "thought" in part
+            and isinstance(part["thought"], str)
+            and "text" not in part
+        ):
+            return None, part["thought"]
+
+        if "text" in part:
+            return part["text"], None
+
+        return None, None
 
     async def generate(
         self,
@@ -490,11 +440,11 @@ class Client:
         stream: bool = False,
         tools: Optional[List[Tool]] = None,
         **kwargs,
-    ) -> Union[ChatResponse, AsyncIterator[Union[str, List[ToolCall]]]]:
+    ) -> Union[ChatResponse, AsyncIterator[StreamChunk]]:
         """Generates a response from the model asynchronously.
 
         Args:
-            model (str): The model ID to use.
+            model (str): The ID of the model to use for generation.
             messages (List[Message]): The conversation history.
             temperature (float, optional): The sampling temperature. Defaults to 0.8.
             stream (bool, optional): Whether to stream the response. Defaults to False.
@@ -502,27 +452,22 @@ class Client:
             **kwargs: Additional generation parameters.
 
         Returns:
-            Union[ChatResponse, AsyncIterator[Union[str, List[ToolCall]]]]: The full ChatResponse, or an async iterator yielding text chunks and eventually a list of tool calls.
+            Union[ChatResponse, AsyncIterator[StreamChunk]]: A complete ChatResponse if stream
+                is False, or an async iterator yielding StreamChunks if stream is True.
 
         Raises:
-            AgentAPIError: If the generation request fails.
+            AgentAPIError: If the generation API request fails.
         """
         await self._check_and_refresh_token()
-
         url = "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
-
         contents = []
         system_instruction = None
-
         for msg in messages:
             if msg.role == "system":
                 system_instruction = {"role": "user", "parts": [{"text": msg.content}]}
                 continue
-
             role = "model" if msg.role == "assistant" else "user"
-
             parts = []
-
             if getattr(msg, "attachments", None):
                 for attachment in msg.attachments:
                     parts.append(
@@ -533,10 +478,10 @@ class Client:
                             }
                         }
                     )
-
+            if getattr(msg, "thought", None):
+                parts.append({"text": msg.thought, "thought": True})
             if msg.content:
                 parts.append({"text": msg.content})
-
             if msg.tool_calls:
                 for tc in msg.tool_calls:
                     part_dict = {
@@ -549,13 +494,11 @@ class Client:
                     if tc.thought_signature:
                         part_dict["thoughtSignature"] = tc.thought_signature
                     parts.append(part_dict)
-
             if msg.role == "tool":
                 try:
                     resp_data = json.loads(msg.content)
-                except:
+                except Exception:
                     resp_data = {"result": msg.content}
-
                 parts = [
                     {
                         "functionResponse": {
@@ -565,9 +508,7 @@ class Client:
                     }
                 ]
                 role = "user"
-
             contents.append({"role": role, "parts": parts})
-
         payload = {
             "model": model,
             "userAgent": "antigravity/2.3.0 macos/arm64",
@@ -581,20 +522,31 @@ class Client:
                     "maxOutputTokens": 64000,
                     "stopSequences": ["\n\nHuman:", "[DONE]"],
                     "temperature": temperature,
+                    "thinkingConfig": {"includeThoughts": True},
                 },
                 "safetySettings": [
-                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
-                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
-                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
-                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
-                    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "OFF"},
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                    {
+                        "category": "HARM_CATEGORY_HATE_SPEECH",
+                        "threshold": "BLOCK_NONE",
+                    },
+                    {
+                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                        "threshold": "BLOCK_NONE",
+                    },
+                    {
+                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                        "threshold": "BLOCK_NONE",
+                    },
+                    {
+                        "category": "HARM_CATEGORY_CIVIC_INTEGRITY",
+                        "threshold": "BLOCK_NONE",
+                    },
                 ],
             },
         }
-
         if system_instruction:
             payload["request"]["systemInstruction"] = system_instruction
-
         if tools:
             func_decls = []
             for t in tools:
@@ -609,7 +561,6 @@ class Client:
             payload["request"]["toolConfig"] = {
                 "functionCallingConfig": {"mode": "AUTO"}
             }
-
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -617,7 +568,7 @@ class Client:
             "Accept": "text/event-stream",
         }
 
-        async def _do_stream() -> AsyncIterator[Union[str, List[ToolCall]]]:
+        async def _do_stream() -> AsyncIterator[StreamChunk]:
             async with httpx.AsyncClient(timeout=60.0) as http_client:
                 async with http_client.stream(
                     "POST", url, json=payload, headers=headers
@@ -627,7 +578,6 @@ class Client:
                         raise AgentAPIError(
                             f"Error {response.status_code}: {error_text.decode('utf-8', errors='replace')}"
                         )
-
                     async for chunk in self._stream_response(response):
                         yield chunk
 
@@ -649,16 +599,16 @@ class Client:
         """Parses a synchronous (non-streaming) response from the API.
 
         Args:
-            response (httpx.Response): The raw HTTP response.
+            response (httpx.Response): The raw HTTP response object.
 
         Returns:
-            ChatResponse: The fully parsed response containing text, usage, and tool calls.
+            ChatResponse: The fully parsed response containing text, thoughts, usage, and tool calls.
         """
         full_text = ""
+        full_thought = ""
         tool_calls = []
         finish_reason = "stop"
         usage = UsageStats(0, 0, 0)
-
         for line_str in response.iter_lines():
             if line_str:
                 if line_str.startswith("data: "):
@@ -671,7 +621,6 @@ class Client:
                             chunks = [chunks]
                         for chunk in chunks:
                             resp = chunk.get("response", {})
-
                             if "usageMetadata" in resp:
                                 meta = resp["usageMetadata"]
                                 usage = UsageStats(
@@ -681,16 +630,17 @@ class Client:
                                     ),
                                     total_tokens=meta.get("totalTokenCount", 0),
                                 )
-
                             candidates = resp.get("candidates", [])
                             for candidate in candidates:
                                 if "finishReason" in candidate:
                                     finish_reason = candidate["finishReason"]
-
                                 parts = candidate.get("content", {}).get("parts", [])
                                 for part in parts:
-                                    if "text" in part:
-                                        full_text += part["text"]
+                                    text_val, thought_val = self._parse_part(part)
+                                    if thought_val:
+                                        full_thought += thought_val
+                                    if text_val:
+                                        full_text += text_val
                                     if "functionCall" in part:
                                         fc = part["functionCall"]
                                         tool_calls.append(
@@ -705,9 +655,9 @@ class Client:
                                         )
                     except json.JSONDecodeError:
                         pass
-
         return ChatResponse(
             text=full_text if full_text else None,
+            thought=full_thought if full_thought else None,
             usage=usage,
             finish_reason=finish_reason,
             tool_calls=tool_calls if tool_calls else None,
@@ -715,16 +665,14 @@ class Client:
 
     async def _stream_response(
         self, response: httpx.Response
-    ) -> AsyncIterator[Union[str, List[ToolCall]]]:
+    ) -> AsyncIterator[StreamChunk]:
         """Parses an async streaming response from the API.
 
-        Yields text chunks and optionally yields a list of tool calls at the end.
-
         Args:
-            response (httpx.Response): The raw HTTP response.
+            response (httpx.Response): The raw HTTP response object.
 
         Yields:
-            Union[str, List[ToolCall]]: Chunks of text generated by the model, or a list of tool calls.
+            StreamChunk: Chunks of generated text, thoughts, or a list of tool calls.
         """
         tool_calls = []
         async for line_str in response.aiter_lines():
@@ -742,8 +690,11 @@ class Client:
                             for candidate in candidates:
                                 parts = candidate.get("content", {}).get("parts", [])
                                 for part in parts:
-                                    if "text" in part:
-                                        yield part["text"]
+                                    text_val, thought_val = self._parse_part(part)
+                                    if thought_val:
+                                        yield StreamChunk(thought=thought_val)
+                                    if text_val:
+                                        yield StreamChunk(text=text_val)
                                     if "functionCall" in part:
                                         fc = part["functionCall"]
                                         tool_calls.append(
@@ -758,6 +709,5 @@ class Client:
                                         )
                     except json.JSONDecodeError:
                         pass
-
         if tool_calls:
-            yield tool_calls
+            yield StreamChunk(tool_calls=tool_calls)
