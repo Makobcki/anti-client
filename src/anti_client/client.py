@@ -23,8 +23,13 @@ from .types import (
 )
 
 OAUTH_CONFIG = {
-    "client_id": os.environ.get("ANTI_CLIENT_ID", "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"),
-    "client_secret": os.environ.get("ANTI_CLIENT_SECRET", "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"),
+    "client_id": os.environ.get(
+        "ANTI_CLIENT_ID",
+        "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+    ),
+    "client_secret": os.environ.get(
+        "ANTI_CLIENT_SECRET", "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"
+    ),
     "callback_port": 51121,
     "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
     "token_url": "https://oauth2.googleapis.com/token",
@@ -45,6 +50,7 @@ server_ready = threading.Event()
 
 class OAuthCallbackHandler(BaseHTTPRequestHandler):
     """Handles the OAuth callback redirect locally."""
+
     def do_GET(self):
         """Processes the GET request for the OAuth callback."""
         global auth_code, auth_error
@@ -75,10 +81,10 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
 
 def start_server() -> int:
     """Starts the local HTTP server to receive the OAuth callback.
-    
+
     Returns:
         int: The port number the server is listening on.
-        
+
     Raises:
         Exception: If no available port could be bound.
     """
@@ -103,7 +109,7 @@ def start_server() -> int:
 
 def authenticate():
     """Authenticates the user via Google OAuth 2.0.
-    
+
     This function starts a local server, opens the user's browser, waits for the OAuth
     callback, exchanges the code for tokens, retrieves the project ID, and saves the
     authentication data to `~/.anti-api/accounts.json`.
@@ -159,9 +165,7 @@ def authenticate():
         "grant_type": "authorization_code",
     }
 
-    response = httpx.post(
-        OAUTH_CONFIG["token_url"], data=token_data, timeout=60.0
-    )
+    response = httpx.post(OAUTH_CONFIG["token_url"], data=token_data, timeout=60.0)
     if response.status_code != 200:
         print(f"Token exchange error: {response.status_code}\n{response.text}")
         return
@@ -186,7 +190,18 @@ def authenticate():
     project_id = "unknown"
     if project_response.status_code == 200:
         project_data = project_response.json()
-        project_id = project_data.get("cloudaicompanionProject", "unknown")
+        raw_project = project_data.get("cloudaicompanionProject")
+        if isinstance(raw_project, dict):
+            project_id = raw_project.get("projectId", "unknown")
+        elif isinstance(raw_project, str) and raw_project:
+            project_id = raw_project
+        else:
+            project_id = "unknown"
+
+        if project_id == "unknown":
+            print(
+                "Warning: Could not extract a valid Project ID from authorization response."
+            )
     else:
         print(
             f"Failed to get Project ID: {project_response.status_code}\n{project_response.text}"
@@ -203,6 +218,7 @@ def authenticate():
     os.makedirs(data_dir, exist_ok=True)
 
     import time
+
     expires_at = time.time() + expires_in
 
     accounts_file = os.path.join(data_dir, "accounts.json")
@@ -235,10 +251,10 @@ def authenticate():
 
 class ModelsResource:
     """Provides methods for querying available models."""
-    
+
     def __init__(self, client: "Client"):
         """Initializes the ModelsResource with a client.
-        
+
         Args:
             client (Client): The main client instance.
         """
@@ -246,10 +262,10 @@ class ModelsResource:
 
     async def list(self) -> List[ModelInfo]:
         """Fetches a list of all available models asynchronously.
-        
+
         Returns:
             List[ModelInfo]: A list of available models and their metadata.
-            
+
         Raises:
             AgentAPIError: If the API request fails.
         """
@@ -267,7 +283,7 @@ class ModelsResource:
 
         async with httpx.AsyncClient(timeout=60.0) as http_client:
             response = await http_client.post(url, json=data, headers=headers)
-            
+
         if response.status_code != 200:
             raise AgentAPIError(
                 f"Error fetching models {response.status_code}: {response.text}"
@@ -308,7 +324,7 @@ class ModelsResource:
 
     async def get(self) -> Dict[str, QuotaInfo]:
         """Gets a mapping of model IDs to their quota info asynchronously.
-        
+
         Returns:
             Dict[str, QuotaInfo]: A dictionary mapping model IDs to their quotas.
         """
@@ -318,23 +334,23 @@ class ModelsResource:
 
 class Client:
     """The main async client for interacting with the Cloud Code (Gemini) API.
-    
+
     Attributes:
         api_key (str): The OAuth access token.
         project_id (str): The Google Cloud project ID.
         models (ModelsResource): Resource for interacting with models.
     """
-    
+
     def __init__(self, api_key: Optional[str] = None, project_id: Optional[str] = None):
         """Initializes the client.
-        
+
         If `api_key` or `project_id` are not provided, it will attempt to load them from
         the local cache file or environment variables.
-        
+
         Args:
             api_key (Optional[str], optional): The OAuth access token. Defaults to None.
             project_id (Optional[str], optional): The Google Cloud project ID. Defaults to None.
-            
+
         Raises:
             AuthError: If authentication tokens are missing.
         """
@@ -353,8 +369,11 @@ class Client:
         self.expires_at = info.get("expiresAt")
 
         if not self.api_key or self.api_key == "YOUR_ACCESS_TOKEN":
+            raise AuthError("API key not provided. Run anti_client.authenticate()")
+
+        if not self.project_id or self.project_id == "unknown":
             raise AuthError(
-                "API key not provided. Run anti_client.authenticate()"
+                "Google Cloud Project ID is unknown. Please run anti_client.authenticate() or initialize Client with a valid project_id (e.g. Client(project_id='your-project-id'))."
             )
 
         self.models = ModelsResource(self)
@@ -371,6 +390,7 @@ class Client:
             return
 
         import time
+
         if self.expires_at and time.time() < (self.expires_at - 60):
             return
 
@@ -389,13 +409,13 @@ class Client:
             try:
                 async with httpx.AsyncClient(timeout=60.0) as http_client:
                     response = await http_client.post(url, data=data)
-                
+
                 if response.status_code == 200:
                     tokens = response.json()
                     self.api_key = tokens.get("access_token")
                     expires_in = tokens.get("expires_in", 3600)
                     self.expires_at = time.time() + expires_in
-                    
+
                     data_dir = os.environ.get("ANTI_API_DATA_DIR")
                     if not data_dir:
                         home = (
@@ -405,7 +425,7 @@ class Client:
                         )
                         data_dir = os.path.join(home, ".anti-api")
                     accounts_file = os.path.join(data_dir, "accounts.json")
-                    
+
                     project_id = self.project_id
                     if os.path.exists(accounts_file):
                         try:
@@ -414,17 +434,19 @@ class Client:
                                 accounts = old_data.get("accounts", [])
                                 if accounts:
                                     if not project_id or project_id == "unknown":
-                                        project_id = accounts[0].get("projectId", "unknown")
+                                        project_id = accounts[0].get(
+                                            "projectId", "unknown"
+                                        )
                         except Exception:
                             pass
-                    
+
                     account_info = {
                         "accessToken": self.api_key,
                         "refreshToken": self.refresh_token,
                         "projectId": project_id,
-                        "expiresAt": self.expires_at
+                        "expiresAt": self.expires_at,
                     }
-                    
+
                     os.makedirs(data_dir, exist_ok=True)
                     with open(accounts_file, "w", encoding="utf-8") as f:
                         json.dump({"accounts": [account_info]}, f)
@@ -433,7 +455,7 @@ class Client:
 
     def _load_account_info(self) -> dict:
         """Loads account information from the local credentials file.
-        
+
         Returns:
             dict: The first account dict, or empty dict if not found.
         """
@@ -470,7 +492,7 @@ class Client:
         **kwargs,
     ) -> Union[ChatResponse, AsyncIterator[Union[str, List[ToolCall]]]]:
         """Generates a response from the model asynchronously.
-        
+
         Args:
             model (str): The model ID to use.
             messages (List[Message]): The conversation history.
@@ -478,10 +500,10 @@ class Client:
             stream (bool, optional): Whether to stream the response. Defaults to False.
             tools (Optional[List[Tool]], optional): A list of tools available to the model. Defaults to None.
             **kwargs: Additional generation parameters.
-            
+
         Returns:
             Union[ChatResponse, AsyncIterator[Union[str, List[ToolCall]]]]: The full ChatResponse, or an async iterator yielding text chunks and eventually a list of tool calls.
-            
+
         Raises:
             AgentAPIError: If the generation request fails.
         """
@@ -500,15 +522,17 @@ class Client:
             role = "model" if msg.role == "assistant" else "user"
 
             parts = []
-            
+
             if getattr(msg, "attachments", None):
                 for attachment in msg.attachments:
-                    parts.append({
-                        "inlineData": {
-                            "mimeType": attachment.mime_type,
-                            "data": attachment.data
+                    parts.append(
+                        {
+                            "inlineData": {
+                                "mimeType": attachment.mime_type,
+                                "data": attachment.data,
+                            }
                         }
-                    })
+                    )
 
             if msg.content:
                 parts.append({"text": msg.content})
@@ -583,7 +607,7 @@ class Client:
                 )
             payload["request"]["tools"] = [{"functionDeclarations": func_decls}]
             payload["request"]["toolConfig"] = {
-                "functionCallingConfig": {"mode": "ANY"}
+                "functionCallingConfig": {"mode": "AUTO"}
             }
 
         headers = {
@@ -595,11 +619,15 @@ class Client:
 
         async def _do_stream() -> AsyncIterator[Union[str, List[ToolCall]]]:
             async with httpx.AsyncClient(timeout=60.0) as http_client:
-                async with http_client.stream("POST", url, json=payload, headers=headers) as response:
+                async with http_client.stream(
+                    "POST", url, json=payload, headers=headers
+                ) as response:
                     if response.status_code != 200:
                         error_text = await response.aread()
-                        raise AgentAPIError(f"Error {response.status_code}: {error_text.decode('utf-8', errors='replace')}")
-                    
+                        raise AgentAPIError(
+                            f"Error {response.status_code}: {error_text.decode('utf-8', errors='replace')}"
+                        )
+
                     async for chunk in self._stream_response(response):
                         yield chunk
 
@@ -607,7 +635,9 @@ class Client:
             async with httpx.AsyncClient(timeout=60.0) as http_client:
                 response = await http_client.post(url, json=payload, headers=headers)
                 if response.status_code != 200:
-                    raise AgentAPIError(f"Error {response.status_code}: {response.text}")
+                    raise AgentAPIError(
+                        f"Error {response.status_code}: {response.text}"
+                    )
                 return self._sync_response(response)
 
         if stream:
@@ -617,10 +647,10 @@ class Client:
 
     def _sync_response(self, response: httpx.Response) -> ChatResponse:
         """Parses a synchronous (non-streaming) response from the API.
-        
+
         Args:
             response (httpx.Response): The raw HTTP response.
-            
+
         Returns:
             ChatResponse: The fully parsed response containing text, usage, and tool calls.
         """
@@ -683,14 +713,16 @@ class Client:
             tool_calls=tool_calls if tool_calls else None,
         )
 
-    async def _stream_response(self, response: httpx.Response) -> AsyncIterator[Union[str, List[ToolCall]]]:
+    async def _stream_response(
+        self, response: httpx.Response
+    ) -> AsyncIterator[Union[str, List[ToolCall]]]:
         """Parses an async streaming response from the API.
-        
+
         Yields text chunks and optionally yields a list of tool calls at the end.
-        
+
         Args:
             response (httpx.Response): The raw HTTP response.
-            
+
         Yields:
             Union[str, List[ToolCall]]: Chunks of text generated by the model, or a list of tool calls.
         """
@@ -726,6 +758,6 @@ class Client:
                                         )
                     except json.JSONDecodeError:
                         pass
-                        
+
         if tool_calls:
             yield tool_calls
