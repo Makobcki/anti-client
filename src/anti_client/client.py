@@ -181,7 +181,7 @@ def authenticate():
         headers={
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "User-Agent": "antigravity/2.0.10 macos/arm64",
+            "User-Agent": "antigravity/2.3.0 macos/arm64",
         },
         json={"metadata": {"ideType": "ANTIGRAVITY"}},
         timeout=60.0,
@@ -276,7 +276,7 @@ class ModelsResource:
         headers = {
             "Authorization": f"Bearer {self._client.api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "antigravity/2.0.10 macos/arm64",
+            "User-Agent": "antigravity/2.3.0 macos/arm64",
         }
 
         data = {"project": self._client.project_id}
@@ -570,7 +570,7 @@ class Client:
 
         payload = {
             "model": model,
-            "userAgent": "antigravity/2.0.10 macos/arm64",
+            "userAgent": "antigravity/2.3.0 macos/arm64",
             "requestType": "agent",
             "project": self.project_id,
             "requestId": f"agent-{uuid.uuid4()}",
@@ -613,7 +613,7 @@ class Client:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-            "User-Agent": "antigravity/2.0.10 macos/arm64",
+            "User-Agent": "antigravity/2.3.0 macos/arm64",
             "Accept": "text/event-stream",
         }
 
