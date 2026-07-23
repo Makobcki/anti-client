@@ -7,6 +7,7 @@ from .exceptions import (
     RateLimitError,
     ToolExecutionError,
 )
+from .mcp import MCPAdapter, load_mcp_tools
 from .types import (
     ChatResponse,
     FileAttachment,
@@ -37,4 +38,6 @@ __all__ = [
     "ModelNotFoundError",
     "RateLimitError",
     "ToolExecutionError",
+    "MCPAdapter",
+    "load_mcp_tools",
 ]
