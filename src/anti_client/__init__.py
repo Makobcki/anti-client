@@ -27,7 +27,10 @@ from .types import (
     UsageStats,
 )
 
+__version__ = "1.1.0"
+
 __all__ = [
+    "__version__",
     "Client",
     "Agent",
     "authenticate",
