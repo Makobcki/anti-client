@@ -37,7 +37,8 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 API_ENDPOINTS = {
-    "production": "https://cloudcode-pa.googleapis.com",
+    "production": "https://daily-cloudcode-pa.googleapis.com",
+    "prod_fallback": "https://cloudcode-pa.googleapis.com",
     "sandbox": "https://daily-cloudcode-pa.sandbox.googleapis.com",
     "autopush": "https://autopush-cloudcode-pa.sandbox.googleapis.com",
 }
