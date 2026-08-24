@@ -97,6 +97,7 @@ class Message:
 
     role: str
     content: Optional[str] = None
+    name: Optional[str] = None
     thought: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None
     tool_call_id: Optional[str] = None

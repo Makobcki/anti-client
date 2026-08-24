@@ -107,7 +107,12 @@ class Agent:
             for tool_call in response.tool_calls:
                 result = await self._execute_tool(tool_call)
                 self.history.append(
-                    Message(role="tool", content=result, tool_call_id=tool_call.id)
+                    Message(
+                        role="tool",
+                        content=result,
+                        tool_call_id=tool_call.id,
+                        name=tool_call.name,
+                    )
                 )
 
         raise AgentAPIError(
@@ -195,7 +200,12 @@ class Agent:
             for tool_call in tool_calls:
                 result = await self._execute_tool(tool_call)
                 self.history.append(
-                    Message(role="tool", content=result, tool_call_id=tool_call.id)
+                    Message(
+                        role="tool",
+                        content=result,
+                        tool_call_id=tool_call.id,
+                        name=tool_call.name,
+                    )
                 )
         raise AgentAPIError(
             f"Agent exceeded the maximum number of steps ({max_steps}) while executing tools."
