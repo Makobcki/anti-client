@@ -1,5 +1,12 @@
 from .agent import Agent
-from .client import Client, authenticate
+from .client import (
+    API_ENDPOINTS,
+    DEFAULT_CLIENT_HEADERS,
+    DEFAULT_PROJECT_ID,
+    Client,
+    authenticate,
+    sanitize_params_for_google,
+)
 from .exceptions import (
     AgentAPIError,
     AuthError,
@@ -24,6 +31,10 @@ __all__ = [
     "Client",
     "Agent",
     "authenticate",
+    "API_ENDPOINTS",
+    "DEFAULT_CLIENT_HEADERS",
+    "DEFAULT_PROJECT_ID",
+    "sanitize_params_for_google",
     "Message",
     "FileAttachment",
     "Tool",

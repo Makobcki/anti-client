@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -11,7 +13,7 @@ import urllib.parse
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import AsyncIterator, Dict, List, Literal, Optional, Union, overload
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union, overload
 
 import httpx
 
@@ -34,6 +36,52 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
+API_ENDPOINTS = {
+    "production": "https://cloudcode-pa.googleapis.com",
+    "sandbox": "https://daily-cloudcode-pa.sandbox.googleapis.com",
+    "autopush": "https://autopush-cloudcode-pa.sandbox.googleapis.com",
+}
+
+DEFAULT_PROJECT_ID = os.environ.get("ANTI_PROJECT_ID", "rising-fact-p41fc")
+
+DEFAULT_CLIENT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Antigravity/1.19.6 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36"
+    ),
+    "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+    "Client-Metadata": json.dumps(
+        {"ideType": "ANTIGRAVITY", "platform": "WINDOWS", "pluginType": "GEMINI"}
+    ),
+}
+
+
+def sanitize_params_for_google(schema: Any) -> Any:
+    """Recursively removes Draft-07 JSON Schema fields unsupported by Google Cloud Code API.
+
+    Fields like `patternProperties`, `additionalProperties`, `$schema`, `allOf`,
+    `anyOf`, `definitions`, and `$defs` cause HTTP 400 Bad Request on the Google backend.
+    """
+    if isinstance(schema, dict):
+        unsupported_keys = {
+            "patternProperties",
+            "additionalProperties",
+            "$schema",
+            "allOf",
+            "anyOf",
+            "definitions",
+            "$defs",
+        }
+        return {
+            k: sanitize_params_for_google(v)
+            for k, v in schema.items()
+            if k not in unsupported_keys
+        }
+    elif isinstance(schema, list):
+        return [sanitize_params_for_google(item) for item in schema]
+    return schema
+
+
 OAUTH_CONFIG = {
     "client_id": os.environ.get(
         "ANTI_CLIENT_ID",
@@ -45,7 +93,7 @@ OAUTH_CONFIG = {
     "callback_port": 51121,
     "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
     "token_url": "https://oauth2.googleapis.com/token",
-    "project_url": "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+    "project_url": f"{API_ENDPOINTS['production']}/v1internal:loadCodeAssist",
     "scopes": [
         "https://www.googleapis.com/auth/cloud-platform",
         "https://www.googleapis.com/auth/userinfo.email",
@@ -94,13 +142,19 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
 
 
 def authenticate():
-    """Authenticates the user via Google OAuth 2.0.
+    """Authenticates the user via Google OAuth 2.0 with PKCE.
     Starts a local server, opens the user's browser for authorization,
     waits for the OAuth callback, exchanges the authorization code for access
     and refresh tokens, retrieves the user's project ID, and saves the
     credentials to `~/.anti-api/accounts.json`.
     """
     state = secrets.token_urlsafe(16)
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
+        .decode("ascii")
+        .rstrip("=")
+    )
 
     result_queue = queue.Queue()
     server_ready = threading.Event()
@@ -149,6 +203,8 @@ def authenticate():
         "access_type": "offline",
         "prompt": "consent",
         "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
     }
 
     auth_url = f"{OAUTH_CONFIG['auth_url']}?{urllib.parse.urlencode(params)}"
@@ -182,6 +238,7 @@ def authenticate():
         "client_secret": OAUTH_CONFIG["client_secret"],
         "redirect_uri": redirect_uri,
         "grant_type": "authorization_code",
+        "code_verifier": code_verifier,
     }
 
     response = httpx.post(OAUTH_CONFIG["token_url"], data=token_data, timeout=60.0)
@@ -194,28 +251,88 @@ def authenticate():
     refresh_token = tokens.get("refresh_token")
     expires_in = tokens.get("expires_in", 3600)
 
-    print("Retrieving Project ID...")
+    print("Retrieving user profile...")
+    user_email = None
+    try:
+        userinfo_resp = httpx.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+            timeout=15.0,
+        )
+        if userinfo_resp.status_code == 200:
+            user_data = userinfo_resp.json()
+            user_email = user_data.get("email")
+            if user_email:
+                print(f"Logged in as: {user_email}")
+    except Exception:
+        pass
+
+    print("Retrieving Project ID (loadCodeAssist)...")
     project_response = httpx.post(
         OAUTH_CONFIG["project_url"],
         headers={
+            **DEFAULT_CLIENT_HEADERS,
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "User-Agent": "antigravity/2.3.0 macos/arm64",
         },
-        json={"metadata": {"ideType": "ANTIGRAVITY"}},
+        json={
+            "metadata": {
+                "ideType": "ANTIGRAVITY",
+                "platform": "WINDOWS",
+                "pluginType": "GEMINI",
+            }
+        },
         timeout=60.0,
     )
 
-    project_id = "unknown"
+    project_id = None
     if project_response.status_code == 200:
         project_data = project_response.json()
         raw_project = project_data.get("cloudaicompanionProject")
         if isinstance(raw_project, dict):
-            project_id = raw_project.get("projectId", "unknown")
+            project_id = raw_project.get("id") or raw_project.get("projectId")
         elif isinstance(raw_project, str) and raw_project:
             project_id = raw_project
-        else:
-            project_id = "unknown"
+
+    # Auto-onboarding if companion project is not assigned
+    if not project_id:
+        print("Project not assigned, performing auto-onboarding (onboardUser)...")
+        try:
+            onboard_url = f"{API_ENDPOINTS['production']}/v1internal:onboardUser"
+            onboard_resp = httpx.post(
+                onboard_url,
+                headers={
+                    **DEFAULT_CLIENT_HEADERS,
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "tierId": "FREE",
+                    "metadata": {
+                        "ideType": "ANTIGRAVITY",
+                        "platform": "WINDOWS",
+                        "pluginType": "GEMINI",
+                    },
+                },
+                timeout=60.0,
+            )
+            if onboard_resp.status_code == 200:
+                onboard_data = onboard_resp.json()
+                raw_onboard_proj = (
+                    onboard_data.get("response", {}).get("cloudaicompanionProject")
+                    or onboard_data.get("cloudaicompanionProject")
+                )
+                if isinstance(raw_onboard_proj, dict):
+                    project_id = raw_onboard_proj.get("id") or raw_onboard_proj.get("projectId")
+                elif isinstance(raw_onboard_proj, str) and raw_onboard_proj:
+                    project_id = raw_onboard_proj
+        except Exception:
+            pass
+
+    if not project_id or project_id == "unknown":
+        project_id = DEFAULT_PROJECT_ID
+
+    print(f"Active Project ID: {project_id}")
 
     data_dir = os.environ.get("ANTI_API_DATA_DIR")
     if not data_dir:
@@ -240,9 +357,11 @@ def authenticate():
     }
     if refresh_token:
         account_info["refreshToken"] = refresh_token
+    if user_email:
+        account_info["email"] = user_email
 
     with open(accounts_file, "w", encoding="utf-8") as f:
-        json.dump({"accounts": [account_info]}, f)
+        json.dump({"accounts": [account_info]}, f, indent=2)
 
     print("Authorization completed and saved successfully!")
 
@@ -264,12 +383,12 @@ class ModelsResource:
         Raises:
             AgentAPIError: If the API request to fetch models fails.
         """
-        url = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+        url = f"{self._client.base_url}/v1internal:fetchAvailableModels"
         await self._client._check_and_refresh_token()
         headers = {
+            **DEFAULT_CLIENT_HEADERS,
             "Authorization": f"Bearer {self._client.api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "antigravity/2.3.0 macos/arm64",
         }
         data = {"project": self._client.project_id}
         response = await self._client.http_client.post(url, json=data, headers=headers)
@@ -317,16 +436,27 @@ class ModelsResource:
 class Client:
     """The main async client for interacting with the Cloud Code (Gemini) API."""
 
-    def __init__(self, api_key: Optional[str] = None, project_id: Optional[str] = None):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        project_id: Optional[str] = None,
+        base_url: Optional[str] = None,
+    ):
         """Initializes the client.
         If `api_key` or `project_id` are not provided, it will attempt to load
         them from the local cache file or environment variables.
         Args:
             api_key (Optional[str], optional): The OAuth access token. Defaults to None.
             project_id (Optional[str], optional): The Google Cloud project ID. Defaults to None.
+            base_url (Optional[str], optional): The API base URL. Defaults to Production.
         Raises:
             AuthError: If authentication tokens or the project ID are missing.
         """
+        self.base_url = (
+            base_url
+            or os.environ.get("ANTI_API_BASE_URL")
+            or API_ENDPOINTS["production"]
+        ).rstrip("/")
         self.api_key = api_key or os.environ.get("MY_API_KEY")
         self.project_id = project_id
         self.refresh_token = None
@@ -336,18 +466,69 @@ class Client:
         if not self.api_key:
             self.api_key = info.get("accessToken")
         if not self.project_id:
-            self.project_id = info.get("projectId", "unknown")
+            self.project_id = (
+                os.environ.get("ANTI_PROJECT_ID")
+                or info.get("projectId")
+                or DEFAULT_PROJECT_ID
+            )
+        if not self.project_id or self.project_id == "unknown":
+            self.project_id = DEFAULT_PROJECT_ID
         self.refresh_token = info.get("refreshToken")
         self.expires_at = info.get("expiresAt")
         if not self.api_key or self.api_key == "YOUR_ACCESS_TOKEN":
             raise AuthError("API key not provided. Run anti_client.authenticate()")
-        if not self.project_id or self.project_id == "unknown":
-            raise AuthError("Google Cloud Project ID is unknown.")
         self.models = ModelsResource(self)
 
     async def close(self) -> None:
         """Closes the underlying HTTP client session."""
         await self.http_client.aclose()
+
+    async def get_user_info(self) -> dict:
+        """Retrieves user profile information (email, name, picture) using the current OAuth token.
+
+        Returns:
+            dict: User information returned by the Google OAuth2 userinfo endpoint.
+        Raises:
+            AgentAPIError: If the request fails.
+        """
+        await self._check_and_refresh_token()
+        url = "https://www.googleapis.com/oauth2/v2/userinfo"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+        }
+        response = await self.http_client.get(url, headers=headers)
+        if response.status_code != 200:
+            self._raise_for_status(response.status_code, response.text)
+        return response.json()
+
+    async def onboard_user(self, tier_id: str = "FREE") -> dict:
+        """Onboards the user and provisions a companion project if not already allocated.
+
+        Args:
+            tier_id (str): The tier ID to enroll in (default: 'FREE').
+        Returns:
+            dict: The response from the onboardUser endpoint.
+        """
+        await self._check_and_refresh_token()
+        url = f"{self.base_url}/v1internal:onboardUser"
+        headers = {
+            **DEFAULT_CLIENT_HEADERS,
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        data = {
+            "tierId": tier_id,
+            "metadata": {
+                "ideType": "ANTIGRAVITY",
+                "platform": "WINDOWS",
+                "pluginType": "GEMINI",
+            },
+        }
+        response = await self.http_client.post(url, json=data, headers=headers)
+        if response.status_code != 200:
+            self._raise_for_status(response.status_code, response.text)
+        return response.json()
 
     async def __aenter__(self) -> Client:
         return self
@@ -531,12 +712,14 @@ class Client:
             AgentAPIError: If the generation API request fails.
         """
         await self._check_and_refresh_token()
-        url = "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+        import time
+
+        url = f"{self.base_url}/v1internal:streamGenerateContent?alt=sse"
         contents = []
         system_instruction = None
         for msg in messages:
             if msg.role == "system":
-                system_instruction = {"role": "user", "parts": [{"text": msg.content}]}
+                system_instruction = {"role": "system", "parts": [{"text": msg.content}]}
                 continue
             role = "model" if msg.role == "assistant" else "user"
             parts = []
@@ -570,31 +753,52 @@ class Client:
                 try:
                     resp_data = json.loads(msg.content)
                 except Exception:
-                    resp_data = {"result": msg.content}
+                    resp_data = msg.content
                 parts = [
                     {
                         "functionResponse": {
-                            "name": msg.tool_call_id or "unknown_tool",
-                            "response": resp_data,
+                            "name": (
+                                getattr(msg, "name", None)
+                                or msg.tool_call_id
+                                or "unknown_tool"
+                            ),
+                            "response": (
+                                resp_data
+                                if isinstance(resp_data, dict)
+                                else {"output": resp_data}
+                            ),
                         }
                     }
                 ]
                 role = "user"
             contents.append({"role": role, "parts": parts})
+
+        if "claude" in model.lower():
+            thinking_config = {
+                "includeThoughts": True,
+                "thinkingBudget": kwargs.get("thinking_budget", 32768),
+            }
+        else:
+            thinking_config = {
+                "includeThoughts": True,
+                "thinkingLevel": kwargs.get("thinking_level", "high"),
+            }
+
         payload = {
-            "model": model,
-            "userAgent": "antigravity/2.3.0 macos/arm64",
-            "requestType": "agent",
             "project": self.project_id,
-            "requestId": f"agent-{uuid.uuid4()}",
+            "model": model,
+            "requestType": "agent",
+            "userAgent": "antigravity",
+            "requestId": f"agent-{int(time.time() * 1000)}",
             "request": {
                 "contents": contents,
-                "sessionId": "-1234567890",
                 "generationConfig": {
-                    "maxOutputTokens": 64000,
-                    "stopSequences": ["\n\nHuman:", "[DONE]"],
+                    "maxOutputTokens": kwargs.get("max_tokens", 65536),
+                    "stopSequences": kwargs.get(
+                        "stop_sequences", ["\n\nHuman:", "[DONE]"]
+                    ),
                     "temperature": temperature,
-                    "thinkingConfig": {"includeThoughts": True},
+                    "thinkingConfig": thinking_config,
                 },
                 "safetySettings": [
                     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -626,7 +830,7 @@ class Client:
                     {
                         "name": t.name,
                         "description": t.description,
-                        "parameters": t.parameters,
+                        "parameters": sanitize_params_for_google(t.parameters),
                     }
                 )
             payload["request"]["tools"] = [{"functionDeclarations": func_decls}]
@@ -634,9 +838,9 @@ class Client:
                 "functionCallingConfig": {"mode": "AUTO"}
             }
         headers = {
+            **DEFAULT_CLIENT_HEADERS,
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-            "User-Agent": "antigravity/2.3.0 macos/arm64",
             "Accept": "text/event-stream",
         }
 
