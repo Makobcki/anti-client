@@ -388,6 +388,7 @@ class ModelsResource:
         Raises:
             AgentAPIError: If the API request to fetch models fails.
         """
+        await self._client.fetch_project_id()
         url = f"{self._client.base_url}/v1internal:fetchAvailableModels"
         await self._client._check_and_refresh_token()
         headers = {
@@ -539,6 +540,47 @@ class Client:
             self.project_id = new_project_id
             self._save_account_info()
         return resp_json
+
+    async def load_code_assist(self) -> dict:
+        """Calls loadCodeAssist to retrieve account tier and project info.
+
+        Returns:
+            dict: The response JSON from loadCodeAssist.
+        """
+        await self._check_and_refresh_token()
+        url = f"{self.base_url}/v1internal:loadCodeAssist"
+        headers = {
+            **DEFAULT_CLIENT_HEADERS,
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        data = {"metadata": {"ideType": "ANTIGRAVITY"}}
+        response = await self.http_client.post(url, json=data, headers=headers)
+        if response.status_code != 200:
+            self._raise_for_status(response.status_code, response.text)
+        return response.json()
+
+    async def fetch_project_id(self, force: bool = False) -> str:
+        """Retrieves and updates the user's active companion project ID via loadCodeAssist.
+
+        Args:
+            force (bool): If True, re-fetches the project ID even if already set.
+        Returns:
+            str: The active project ID.
+        """
+        if self.project_id and self.project_id != DEFAULT_PROJECT_ID and not force:
+            return self.project_id
+
+        try:
+            code_assist_data = await self.load_code_assist()
+            proj_id = _extract_project_id(code_assist_data)
+            if proj_id:
+                self.project_id = proj_id
+                self._save_account_info()
+                return proj_id
+        except Exception:
+            pass
+        return self.project_id
 
     async def __aenter__(self) -> Client:
         return self
@@ -735,6 +777,7 @@ class Client:
         Raises:
             AgentAPIError: If the generation API request fails.
         """
+        await self.fetch_project_id()
         await self._check_and_refresh_token()
         import time
 
