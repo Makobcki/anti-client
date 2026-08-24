@@ -82,6 +82,25 @@ def sanitize_params_for_google(schema: Any) -> Any:
     return schema
 
 
+def _extract_project_id(data: Any) -> Optional[str]:
+    """Extracts and normalizes the project ID from an API response.
+
+    Handles string IDs, dictionary structures, resource paths (e.g. 'projects/123'),
+    and ignores empty dictionaries.
+    """
+    if not isinstance(data, dict):
+        return None
+    for key in ("cloudaicompanionProject", "projectId", "project"):
+        val = data.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip().removeprefix("projects/")
+        if isinstance(val, dict):
+            proj_id = val.get("id") or val.get("projectId") or val.get("name")
+            if isinstance(proj_id, str) and proj_id.strip():
+                return proj_id.strip().removeprefix("projects/")
+    return None
+
+
 OAUTH_CONFIG = {
     "client_id": os.environ.get(
         "ANTI_CLIENT_ID",
@@ -268,64 +287,50 @@ def authenticate():
         pass
 
     print("Retrieving Project ID (loadCodeAssist)...")
-    project_response = httpx.post(
-        OAUTH_CONFIG["project_url"],
-        headers={
-            **DEFAULT_CLIENT_HEADERS,
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "metadata": {
-                "ideType": "ANTIGRAVITY",
-                "platform": "WINDOWS",
-                "pluginType": "GEMINI",
-            }
-        },
-        timeout=60.0,
-    )
-
     project_id = None
-    if project_response.status_code == 200:
-        project_data = project_response.json()
-        raw_project = project_data.get("cloudaicompanionProject")
-        if isinstance(raw_project, dict):
-            project_id = raw_project.get("id") or raw_project.get("projectId")
-        elif isinstance(raw_project, str) and raw_project:
-            project_id = raw_project
+    try:
+        project_response = httpx.post(
+            OAUTH_CONFIG["project_url"],
+            headers={
+                **DEFAULT_CLIENT_HEADERS,
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={"metadata": {"ideType": "ANTIGRAVITY"}},
+            timeout=60.0,
+        )
+        if project_response.status_code == 200:
+            project_data = project_response.json()
+            project_id = _extract_project_id(project_data)
+    except Exception:
+        pass
 
     # Auto-onboarding if companion project is not assigned
     if not project_id:
         print("Project not assigned, performing auto-onboarding (onboardUser)...")
         try:
             onboard_url = f"{API_ENDPOINTS['production']}/v1internal:onboardUser"
-            onboard_resp = httpx.post(
-                onboard_url,
-                headers={
-                    **DEFAULT_CLIENT_HEADERS,
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "tierId": "FREE",
-                    "metadata": {
-                        "ideType": "ANTIGRAVITY",
-                        "platform": "WINDOWS",
-                        "pluginType": "GEMINI",
+            for tier in ("free-tier", "standard-tier"):
+                onboard_resp = httpx.post(
+                    onboard_url,
+                    headers={
+                        **DEFAULT_CLIENT_HEADERS,
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json",
                     },
-                },
-                timeout=60.0,
-            )
-            if onboard_resp.status_code == 200:
-                onboard_data = onboard_resp.json()
-                raw_onboard_proj = (
-                    onboard_data.get("response", {}).get("cloudaicompanionProject")
-                    or onboard_data.get("cloudaicompanionProject")
+                    json={
+                        "tierId": tier,
+                        "metadata": {"ideType": "ANTIGRAVITY"},
+                    },
+                    timeout=60.0,
                 )
-                if isinstance(raw_onboard_proj, dict):
-                    project_id = raw_onboard_proj.get("id") or raw_onboard_proj.get("projectId")
-                elif isinstance(raw_onboard_proj, str) and raw_onboard_proj:
-                    project_id = raw_onboard_proj
+                if onboard_resp.status_code == 200:
+                    onboard_data = onboard_resp.json()
+                    project_id = _extract_project_id(
+                        onboard_data.get("response")
+                    ) or _extract_project_id(onboard_data)
+                    if project_id:
+                        break
         except Exception:
             pass
 
@@ -502,11 +507,11 @@ class Client:
             self._raise_for_status(response.status_code, response.text)
         return response.json()
 
-    async def onboard_user(self, tier_id: str = "FREE") -> dict:
+    async def onboard_user(self, tier_id: str = "free-tier") -> dict:
         """Onboards the user and provisions a companion project if not already allocated.
 
         Args:
-            tier_id (str): The tier ID to enroll in (default: 'FREE').
+            tier_id (str): The tier ID to enroll in (default: 'free-tier').
         Returns:
             dict: The response from the onboardUser endpoint.
         """
@@ -521,14 +526,19 @@ class Client:
             "tierId": tier_id,
             "metadata": {
                 "ideType": "ANTIGRAVITY",
-                "platform": "WINDOWS",
-                "pluginType": "GEMINI",
             },
         }
         response = await self.http_client.post(url, json=data, headers=headers)
         if response.status_code != 200:
             self._raise_for_status(response.status_code, response.text)
-        return response.json()
+        resp_json = response.json()
+        new_project_id = _extract_project_id(
+            resp_json.get("response")
+        ) or _extract_project_id(resp_json)
+        if new_project_id:
+            self.project_id = new_project_id
+            self._save_account_info()
+        return resp_json
 
     async def __aenter__(self) -> Client:
         return self
@@ -570,17 +580,48 @@ class Client:
             self._async_lock = asyncio.Lock()
         return self._async_lock
 
+    def _save_account_info(self) -> None:
+        """Saves or updates account information in the local credentials file."""
+        data_dir = os.environ.get("ANTI_API_DATA_DIR")
+        if not data_dir:
+            home = (
+                os.environ.get("HOME")
+                or os.environ.get("USERPROFILE")
+                or os.path.expanduser("~")
+            )
+            data_dir = os.path.join(home, ".anti-api")
+        accounts_file = os.path.join(data_dir, "accounts.json")
+        account_info = self._load_account_info()
+        account_info.update(
+            {
+                "accessToken": self.api_key,
+                "refreshToken": self.refresh_token,
+                "projectId": self.project_id,
+                "expiresAt": self.expires_at,
+            }
+        )
+        os.makedirs(data_dir, exist_ok=True)
+        try:
+            with open(accounts_file, "w", encoding="utf-8") as f:
+                json.dump({"accounts": [account_info]}, f, indent=2)
+        except Exception:
+            pass
+
     async def _check_and_refresh_token(self):
         """Checks if the access token has expired and refreshes it if possible."""
         if not self.refresh_token:
             return
         import time
 
-        if self.expires_at and time.time() < (self.expires_at - 60):
-            return
-        async with self._lock:
-            if self.expires_at and time.time() < (self.expires_at - 60):
+        if self.expires_at:
+            exp = self.expires_at / 1000.0 if self.expires_at > 1e11 else self.expires_at
+            if time.time() < (exp - 60):
                 return
+        async with self._lock:
+            if self.expires_at:
+                exp = self.expires_at / 1000.0 if self.expires_at > 1e11 else self.expires_at
+                if time.time() < (exp - 60):
+                    return
             url = OAUTH_CONFIG["token_url"]
             data = {
                 "client_id": OAUTH_CONFIG["client_id"],
@@ -595,24 +636,7 @@ class Client:
                     self.api_key = tokens.get("access_token")
                     expires_in = tokens.get("expires_in", 3600)
                     self.expires_at = time.time() + expires_in
-                    data_dir = os.environ.get("ANTI_API_DATA_DIR")
-                    if not data_dir:
-                        home = (
-                            os.environ.get("HOME")
-                            or os.environ.get("USERPROFILE")
-                            or os.path.expanduser("~")
-                        )
-                        data_dir = os.path.join(home, ".anti-api")
-                    accounts_file = os.path.join(data_dir, "accounts.json")
-                    account_info = {
-                        "accessToken": self.api_key,
-                        "refreshToken": self.refresh_token,
-                        "projectId": self.project_id,
-                        "expiresAt": self.expires_at,
-                    }
-                    os.makedirs(data_dir, exist_ok=True)
-                    with open(accounts_file, "w", encoding="utf-8") as f:
-                        json.dump({"accounts": [account_info]}, f)
+                    self._save_account_info()
             except Exception:
                 pass
 
