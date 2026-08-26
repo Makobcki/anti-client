@@ -98,14 +98,15 @@ class Agent:
                 **kwargs,
             )
 
-            self.history.append(
-                Message(
-                    role="assistant",
-                    content=response.text,
-                    thought=response.thought,
-                    tool_calls=response.tool_calls,
+            if response.text or response.thought or response.tool_calls:
+                self.history.append(
+                    Message(
+                        role="assistant",
+                        content=response.text,
+                        thought=response.thought,
+                        tool_calls=response.tool_calls,
+                    )
                 )
-            )
 
             if not response.tool_calls:
                 return response
@@ -193,14 +194,15 @@ class Agent:
                 elif isinstance(chunk, str):
                     full_text += chunk
                     yield StreamChunk(text=chunk)
-            self.history.append(
-                Message(
-                    role="assistant",
-                    content=full_text if full_text else None,
-                    thought=full_thought if full_thought else None,
-                    tool_calls=tool_calls if tool_calls else None,
+            if full_text or full_thought or tool_calls:
+                self.history.append(
+                    Message(
+                        role="assistant",
+                        content=full_text if full_text else None,
+                        thought=full_thought if full_thought else None,
+                        tool_calls=tool_calls if tool_calls else None,
+                    )
                 )
-            )
             if not tool_calls:
                 return
             for tool_call in tool_calls:

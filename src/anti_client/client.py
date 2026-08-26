@@ -840,7 +840,8 @@ class Client:
                     }
                 ]
                 role = "user"
-            contents.append({"role": role, "parts": parts})
+            if parts:
+                contents.append({"role": role, "parts": parts})
 
         if "claude" in model.lower():
             thinking_config = {
