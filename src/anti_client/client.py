@@ -785,7 +785,8 @@ class Client:
         url = f"{self.base_url}/v1internal:streamGenerateContent?alt=sse"
         contents = []
         system_instruction = None
-        for msg in messages:
+        for raw_msg in messages:
+            msg = Message(**raw_msg) if isinstance(raw_msg, dict) else raw_msg
             if msg.role == "system":
                 system_instruction = {"role": "system", "parts": [{"text": msg.content}]}
                 continue
@@ -844,13 +845,32 @@ class Client:
         if "claude" in model.lower():
             thinking_config = {
                 "includeThoughts": True,
-                "thinkingBudget": kwargs.get("thinking_budget", 32768),
+                "thinkingBudget": kwargs.get("thinking_budget", 4096),
             }
         else:
             thinking_config = {
                 "includeThoughts": True,
                 "thinkingLevel": kwargs.get("thinking_level", "high"),
             }
+
+        generation_config: Dict[str, Any] = {
+            "temperature": temperature,
+            "maxOutputTokens": kwargs.get("max_tokens") or kwargs.get("max_output_tokens", 8192),
+        }
+        if "stop_sequences" in kwargs:
+            generation_config["stopSequences"] = kwargs["stop_sequences"]
+        if thinking_config:
+            generation_config["thinkingConfig"] = thinking_config
+
+        safety_settings = kwargs.get(
+            "safety_settings",
+            [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ],
+        )
 
         payload = {
             "project": self.project_id,
@@ -860,33 +880,8 @@ class Client:
             "requestId": f"agent-{int(time.time() * 1000)}",
             "request": {
                 "contents": contents,
-                "generationConfig": {
-                    "maxOutputTokens": kwargs.get("max_tokens", 65536),
-                    "stopSequences": kwargs.get(
-                        "stop_sequences", ["\n\nHuman:", "[DONE]"]
-                    ),
-                    "temperature": temperature,
-                    "thinkingConfig": thinking_config,
-                },
-                "safetySettings": [
-                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                    {
-                        "category": "HARM_CATEGORY_HATE_SPEECH",
-                        "threshold": "BLOCK_NONE",
-                    },
-                    {
-                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                        "threshold": "BLOCK_NONE",
-                    },
-                    {
-                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                        "threshold": "BLOCK_NONE",
-                    },
-                    {
-                        "category": "HARM_CATEGORY_CIVIC_INTEGRITY",
-                        "threshold": "BLOCK_NONE",
-                    },
-                ],
+                "generationConfig": generation_config,
+                "safetySettings": safety_settings,
             },
         }
         if system_instruction:
@@ -950,9 +945,10 @@ class Client:
         usage = UsageStats(0, 0, 0)
 
         for line_str in response.iter_lines():
+            line_str = line_str.strip()
             if line_str:
                 if line_str.startswith("data: "):
-                    data_str = line_str[6:]
+                    data_str = line_str[6:].strip()
                     if data_str == "[DONE]":
                         break
                     try:
@@ -1017,9 +1013,10 @@ class Client:
         tool_calls = []
 
         async for line_str in response.aiter_lines():
+            line_str = line_str.strip()
             if line_str:
                 if line_str.startswith("data: "):
-                    data_str = line_str[6:]
+                    data_str = line_str[6:].strip()
                     if data_str == "[DONE]":
                         break
                     try:
