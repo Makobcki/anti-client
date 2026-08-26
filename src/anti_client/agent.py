@@ -43,6 +43,7 @@ class Agent:
         temperature: float = 0.8,
         stream: Literal[False] = False,
         max_steps: int = 5,
+        attachments: Optional[List[Any]] = None,
         **kwargs,
     ) -> ChatResponse: ...
 
@@ -53,6 +54,7 @@ class Agent:
         temperature: float = 0.8,
         stream: Literal[True] = True,
         max_steps: int = 5,
+        attachments: Optional[List[Any]] = None,
         **kwargs,
     ) -> AsyncIterator[StreamChunk]: ...
 
@@ -62,6 +64,7 @@ class Agent:
         temperature: float = 0.8,
         stream: bool = False,
         max_steps: int = 5,
+        attachments: Optional[List[Any]] = None,
         **kwargs,
     ) -> Union[ChatResponse, AsyncIterator[StreamChunk]]:
         """Runs the agent asynchronously with a new user prompt.
@@ -70,6 +73,7 @@ class Agent:
             temperature (float, optional): The sampling temperature for generation. Defaults to 0.8.
             stream (bool, optional): If True, streams the response as an async iterator. Defaults to False.
             max_steps (int, optional): The maximum number of tool execution steps allowed. Defaults to 5.
+            attachments (Optional[List[Any]], optional): Optional file attachments for the user message.
             **kwargs: Additional keyword arguments passed to the client's generate method.
         Returns:
             Union[ChatResponse, AsyncIterator[StreamChunk]]: A ChatResponse object if stream is False,
@@ -77,7 +81,9 @@ class Agent:
         Raises:
             AgentAPIError: If the maximum number of steps is exceeded while executing tools.
         """
-        self.history.append(Message(role="user", content=prompt))
+        self.history.append(
+            Message(role="user", content=prompt, attachments=attachments)
+        )
 
         if stream:
             return self._run_stream(temperature, max_steps, **kwargs)
@@ -231,3 +237,24 @@ class Agent:
         self.history = []
         if self.system_prompt:
             self.history.append(Message(role="system", content=self.system_prompt))
+
+    def truncate_history(self, max_length: int = 100) -> None:
+        """Truncates conversation history to a maximum length while preserving the system prompt.
+
+        Args:
+            max_length (int): Maximum number of messages to keep in history.
+        """
+        if len(self.history) <= max_length:
+            return
+
+        system_msgs = [m for m in self.history if m.role == "system"]
+        non_system = [m for m in self.history if m.role != "system"]
+
+        keep_count = max(0, max_length - len(system_msgs))
+        truncated = non_system[-keep_count:] if keep_count > 0 else []
+
+        # Avoid starting history with an orphaned tool response
+        while truncated and truncated[0].role == "tool":
+            truncated.pop(0)
+
+        self.history = system_msgs + truncated
