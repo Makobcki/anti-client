@@ -82,7 +82,7 @@ async def test_generate_image(mock_catalog):
     ):
         with patch.object(
             client, "_post_with_fallback", new_callable=AsyncMock, return_value=mock_resp
-        ):
+        ) as mock_post:
             res = await client.generate_image("A futuristic city skyline", aspect_ratio="16:9")
 
             assert isinstance(res, ImageGenerationResponse)
@@ -92,6 +92,15 @@ async def test_generate_image(mock_catalog):
             assert img.mime_type == "image/png"
             assert img.data == raw_b64
             assert len(img.to_bytes()) > 0
+
+            # Verify payload structure
+            call_kwargs = mock_post.call_args.kwargs
+            payload = call_kwargs["json_data"]
+            assert payload["request"]["contents"][0]["parts"][0]["text"] == (
+                "A futuristic city skyline\nAspect ratio: 16:9"
+            )
+            assert "aspectRatio" not in payload["request"]["generationConfig"]
+            assert "safetySettings" in payload["request"]
 
 
 @pytest.mark.asyncio

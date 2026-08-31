@@ -1587,16 +1587,28 @@ class Client:
 
         url = f"{self.base_url}/v1internal:streamGenerateContent?alt=sse"
 
+        prompt_text = prompt
+        if aspect_ratio:
+            prompt_text += f"\nAspect ratio: {aspect_ratio}"
+        if negative_prompt:
+            prompt_text += f"\nNegative prompt: {negative_prompt}"
+
         gen_config: dict[str, Any] = {
             "responseModalities": ["IMAGE"],
             "temperature": kwargs.get("temperature", 0.7),
         }
-        if aspect_ratio:
-            gen_config["aspectRatio"] = aspect_ratio
-        if negative_prompt:
-            gen_config["negativePrompt"] = negative_prompt
         if number_of_images > 1:
             gen_config["candidateCount"] = number_of_images
+
+        safety_settings = kwargs.get(
+            "safety_settings",
+            [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ],
+        )
 
         payload = {
             "project": self.project_id,
@@ -1608,10 +1620,11 @@ class Client:
                 "contents": [
                     {
                         "role": "user",
-                        "parts": [{"text": prompt}],
+                        "parts": [{"text": prompt_text}],
                     }
                 ],
                 "generationConfig": gen_config,
+                "safetySettings": safety_settings,
             },
         }
 
