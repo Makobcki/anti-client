@@ -222,12 +222,395 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
         """Suppresses standard HTTP server log messages."""
 
 
-def authenticate() -> None:
+def resolve_accounts_path(
+    credentials_path: str | os.PathLike[str] | None = None,
+    data_dir: str | os.PathLike[str] | None = None,
+    for_saving: bool = False,
+    save_to_project: bool = False,
+) -> str:
+    """Resolves the path to the accounts.json credentials file.
+
+    Priority:
+    1. Explicit `credentials_path` argument
+    2. Explicit `data_dir` argument (appends accounts.json)
+    3. `ANTI_ACCOUNTS_PATH`, `ANTI_ACCOUNTS_FILE`, or `ANTI_CREDENTIALS_PATH` env var
+    4. `ANTI_API_DATA_DIR` env var (appends accounts.json)
+    5. If `save_to_project` is True (or ANTI_SAVE_TO_PROJECT set):
+       - If ./accounts.json exists in cwd: ./accounts.json
+       - Else: ./.anti-api/accounts.json
+    6. When loading (for_saving=False):
+       - ./.anti-api/accounts.json (if exists)
+       - ./accounts.json (if exists)
+       - ./.anti-accounts.json (if exists)
+       - Fallback to ~/.anti-api/accounts.json
+    7. When saving (for_saving=True):
+       - If project-level file already exists in cwd: uses that file
+       - Fallback to ~/.anti-api/accounts.json
+    """
+    if credentials_path:
+        return os.path.abspath(os.path.expanduser(str(credentials_path)))
+
+    if data_dir:
+        return os.path.abspath(os.path.join(os.path.expanduser(str(data_dir)), "accounts.json"))
+
+    env_path = (
+        os.environ.get("ANTI_ACCOUNTS_PATH")
+        or os.environ.get("ANTI_ACCOUNTS_FILE")
+        or os.environ.get("ANTI_CREDENTIALS_PATH")
+    )
+    if env_path:
+        return os.path.abspath(os.path.expanduser(env_path))
+
+    env_dir = os.environ.get("ANTI_API_DATA_DIR")
+    if env_dir:
+        return os.path.abspath(os.path.join(os.path.expanduser(env_dir), "accounts.json"))
+
+    project_save_env = os.environ.get("ANTI_SAVE_TO_PROJECT", "").lower() in ("1", "true", "yes")
+    if save_to_project or project_save_env:
+        if os.path.exists(os.path.abspath("accounts.json")):
+            return os.path.abspath("accounts.json")
+        return os.path.abspath(os.path.join(".anti-api", "accounts.json"))
+
+    project_candidates = [
+        os.path.abspath(os.path.join(".anti-api", "accounts.json")),
+        os.path.abspath("accounts.json"),
+        os.path.abspath(".anti-accounts.json"),
+    ]
+    for cand in project_candidates:
+        if os.path.exists(cand):
+            return cand
+
+    home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    return os.path.abspath(os.path.join(home, ".anti-api", "accounts.json"))
+
+
+def list_accounts(
+    credentials_path: str | os.PathLike[str] | None = None,
+    data_dir: str | os.PathLike[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Returns a list of all configured account dictionaries from the credentials file."""
+    accounts_file = resolve_accounts_path(
+        credentials_path=credentials_path, data_dir=data_dir, for_saving=False
+    )
+    if not os.path.exists(accounts_file):
+        return []
+    try:
+        with open(accounts_file, encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                raw_accounts = data.get("accounts", [])
+                if isinstance(raw_accounts, list):
+                    return [acc for acc in raw_accounts if isinstance(acc, dict)]
+    except Exception:
+        pass
+    return []
+
+
+def get_account(
+    email: str | None = None,
+    index: int | None = None,
+    credentials_path: str | os.PathLike[str] | None = None,
+    data_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, Any] | None:
+    """Retrieves a specific account dictionary by email or index."""
+    accounts = list_accounts(credentials_path=credentials_path, data_dir=data_dir)
+    if not accounts:
+        return None
+    if email is not None:
+        for acc in accounts:
+            if acc.get("email", "").lower() == email.lower():
+                return acc
+        return None
+    if index is not None:
+        if 0 <= index < len(accounts):
+            return accounts[index]
+        return None
+    return accounts[0]
+
+
+def save_account(
+    account_info: dict[str, Any],
+    credentials_path: str | os.PathLike[str] | None = None,
+    data_dir: str | os.PathLike[str] | None = None,
+    save_to_project: bool = False,
+    make_active: bool = False,
+) -> str:
+    """Saves or updates an account entry in the credentials file without overwriting other accounts.
+
+    Returns the absolute path to the saved credentials file.
+    """
+    accounts_file = resolve_accounts_path(
+        credentials_path=credentials_path,
+        data_dir=data_dir,
+        for_saving=True,
+        save_to_project=save_to_project,
+    )
+    accounts: list[dict[str, Any]] = []
+    active_account = None
+
+    if os.path.exists(accounts_file):
+        try:
+            with open(accounts_file, encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    raw_accounts = data.get("accounts", [])
+                    if isinstance(raw_accounts, list):
+                        accounts = [acc for acc in raw_accounts if isinstance(acc, dict)]
+                    active_account = data.get("activeAccount")
+        except Exception:
+            accounts = []
+
+    email = account_info.get("email")
+    refresh_token = account_info.get("refreshToken")
+
+    target_idx = -1
+    if email:
+        for idx, acc in enumerate(accounts):
+            if acc.get("email", "").lower() == email.lower():
+                target_idx = idx
+                break
+    elif refresh_token:
+        for idx, acc in enumerate(accounts):
+            if acc.get("refreshToken") == refresh_token:
+                target_idx = idx
+                break
+
+    if target_idx >= 0:
+        merged = dict(accounts[target_idx])
+        merged.update(account_info)
+        accounts[target_idx] = merged
+    else:
+        accounts.append(dict(account_info))
+
+    payload: dict[str, Any] = {"accounts": accounts}
+    if make_active and email:
+        payload["activeAccount"] = email
+    elif active_account:
+        payload["activeAccount"] = active_account
+    elif email:
+        payload["activeAccount"] = email
+
+    os.makedirs(os.path.dirname(accounts_file), exist_ok=True)
+    with open(accounts_file, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    return accounts_file
+
+
+def remove_account(
+    email: str | None = None,
+    index: int | None = None,
+    credentials_path: str | os.PathLike[str] | None = None,
+    data_dir: str | os.PathLike[str] | None = None,
+) -> bool:
+    """Removes an account by email or index from the credentials file.
+
+    Returns True if an account was removed, False otherwise.
+    """
+    accounts_file = resolve_accounts_path(
+        credentials_path=credentials_path, data_dir=data_dir, for_saving=False
+    )
+    if not os.path.exists(accounts_file):
+        return False
+    try:
+        with open(accounts_file, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return False
+        accounts = data.get("accounts", [])
+        if not isinstance(accounts, list):
+            return False
+
+        target_idx = -1
+        if email is not None:
+            for idx, acc in enumerate(accounts):
+                if isinstance(acc, dict) and acc.get("email", "").lower() == email.lower():
+                    target_idx = idx
+                    break
+        elif index is not None and 0 <= index < len(accounts):
+            target_idx = index
+
+        if target_idx == -1:
+            return False
+
+        removed = accounts.pop(target_idx)
+        active = data.get("activeAccount")
+        if active and isinstance(removed, dict) and removed.get("email") == active:
+            data["activeAccount"] = (
+                accounts[0].get("email")
+                if accounts and isinstance(accounts[0], dict) and "email" in accounts[0]
+                else None
+            )
+
+        data["accounts"] = accounts
+        with open(accounts_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def set_active_account(
+    email: str,
+    credentials_path: str | os.PathLike[str] | None = None,
+    data_dir: str | os.PathLike[str] | None = None,
+) -> bool:
+    """Sets the active account email in the credentials file.
+
+    Returns True if the account exists and was set as active, False otherwise.
+    """
+    accounts_file = resolve_accounts_path(
+        credentials_path=credentials_path, data_dir=data_dir, for_saving=False
+    )
+    if not os.path.exists(accounts_file):
+        return False
+    try:
+        with open(accounts_file, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return False
+        accounts = data.get("accounts", [])
+        if not isinstance(accounts, list):
+            return False
+
+        found = any(
+            isinstance(acc, dict) and acc.get("email", "").lower() == email.lower()
+            for acc in accounts
+        )
+        if not found:
+            return False
+
+        data["activeAccount"] = email
+        with open(accounts_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def logout(
+    email: str | None = None,
+    index: int | None = None,
+    all_accounts: bool = False,
+    revoke: bool = True,
+    credentials_path: str | os.PathLike[str] | None = None,
+    data_dir: str | os.PathLike[str] | None = None,
+) -> bool:
+    """Logs out one or all accounts by removing credentials and optionally revoking OAuth tokens with Google.
+
+    Args:
+        email (Optional[str]): Email of the specific account to log out.
+        index (Optional[int]): Index of the specific account to log out.
+        all_accounts (bool): If True, logs out and removes all accounts from credentials file. Defaults to False.
+        revoke (bool): If True, attempts to revoke the OAuth token with Google. Defaults to True.
+        credentials_path (Optional[Union[str, PathLike]]): Explicit path to credentials file.
+        data_dir (Optional[Union[str, PathLike]]): Directory containing accounts.json.
+
+    Returns:
+        bool: True if an account or all accounts were successfully removed/logged out, False otherwise.
+    """
+    accounts_file = resolve_accounts_path(
+        credentials_path=credentials_path, data_dir=data_dir, for_saving=False
+    )
+    if not os.path.exists(accounts_file):
+        return False
+
+    try:
+        with open(accounts_file, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return False
+        accounts = data.get("accounts", [])
+        if not isinstance(accounts, list) or not accounts:
+            return False
+
+        def _revoke_token(token: str | None) -> None:
+            if not token or not revoke:
+                return
+            try:
+                httpx.post(
+                    "https://oauth2.googleapis.com/revoke",
+                    params={"token": token},
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=5.0,
+                )
+            except Exception:
+                pass
+
+        if all_accounts:
+            for acc in accounts:
+                if isinstance(acc, dict):
+                    _revoke_token(acc.get("refreshToken") or acc.get("accessToken"))
+            try:
+                os.remove(accounts_file)
+            except Exception:
+                with open(accounts_file, "w", encoding="utf-8") as f:
+                    json.dump({"accounts": []}, f, indent=2)
+            return True
+
+        target_idx = -1
+        if email is not None:
+            for idx, acc in enumerate(accounts):
+                if isinstance(acc, dict) and acc.get("email", "").lower() == email.lower():
+                    target_idx = idx
+                    break
+        elif index is not None:
+            if 0 <= index < len(accounts):
+                target_idx = index
+        else:
+            active = data.get("activeAccount")
+            if active:
+                for idx, acc in enumerate(accounts):
+                    if (
+                        isinstance(acc, dict)
+                        and acc.get("email", "").lower() == str(active).lower()
+                    ):
+                        target_idx = idx
+                        break
+            if target_idx == -1 and accounts:
+                target_idx = 0
+
+        if target_idx == -1:
+            return False
+
+        removed = accounts.pop(target_idx)
+        if isinstance(removed, dict):
+            _revoke_token(removed.get("refreshToken") or removed.get("accessToken"))
+
+        active = data.get("activeAccount")
+        if active and isinstance(removed, dict) and removed.get("email") == active:
+            data["activeAccount"] = (
+                accounts[0].get("email")
+                if accounts and isinstance(accounts[0], dict) and "email" in accounts[0]
+                else None
+            )
+
+        data["accounts"] = accounts
+        with open(accounts_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def authenticate(
+    credentials_path: str | os.PathLike[str] | None = None,
+    data_dir: str | os.PathLike[str] | None = None,
+    save_to_project: bool = False,
+) -> dict[str, Any] | None:
     """Authenticates the user via Google OAuth 2.0 with PKCE and stores credentials locally.
 
     Spawns a local HTTP server callback, opens the default web browser to the Google OAuth consent
     screen, exchanges the authorization code for access and refresh tokens, retrieves the user's
-    companion Cloud project ID via loadCodeAssist, and saves credentials to ~/.anti-api/accounts.json.
+    companion Cloud project ID via loadCodeAssist, and saves credentials to the accounts file.
+
+    Args:
+        credentials_path (Optional[Union[str, PathLike]]): Explicit target path for credentials file.
+        data_dir (Optional[Union[str, PathLike]]): Target directory for accounts.json.
+        save_to_project (bool): If True, saves to project directory (.anti-api/accounts.json).
+
+    Returns:
+        Optional[dict]: The authenticated account dictionary if successful, None otherwise.
     """
     state = secrets.token_urlsafe(16)
     code_verifier = secrets.token_urlsafe(64)
@@ -271,7 +654,7 @@ def authenticate() -> None:
 
     if not server_port_box:
         print("Failed to start the local HTTP server.")
-        return
+        return None
 
     actual_port = server_port_box[0]
     redirect_uri = f"http://localhost:{actual_port}/oauth-callback"
@@ -298,18 +681,18 @@ def authenticate() -> None:
         result = result_queue.get(timeout=300)
     except queue.Empty:
         print("Authorization timed out.")
-        return
+        return None
 
     auth_error = result.get("error")
     auth_code = result.get("code")
 
     if auth_error:
         print(f"Authorization error: {auth_error}")
-        return
+        return None
 
     if not auth_code:
         print("Authorization was not completed.")
-        return
+        return None
 
     print("Authorization code received. Exchanging for tokens...")
 
@@ -330,7 +713,7 @@ def authenticate() -> None:
         response = httpx.post(OAUTH_CONFIG["token_url"], data=token_data, timeout=60.0)
         if response.status_code != 200:
             print(f"Token exchange error: {response.status_code}\n{response.text}")
-            return
+            return None
 
     tokens = response.json()
     access_token = tokens.get("access_token")
@@ -405,17 +788,9 @@ def authenticate() -> None:
 
     print(f"Active Project ID: {project_id}")
 
-    data_dir = os.environ.get("ANTI_API_DATA_DIR")
-    if not data_dir:
-        home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
-        data_dir = os.path.join(home, ".anti-api")
-
-    os.makedirs(data_dir, exist_ok=True)
-
     import time
 
     expires_at = time.time() + expires_in
-    accounts_file = os.path.join(data_dir, "accounts.json")
 
     account_info = {
         "accessToken": access_token,
@@ -427,10 +802,16 @@ def authenticate() -> None:
     if user_email:
         account_info["email"] = user_email
 
-    with open(accounts_file, "w", encoding="utf-8") as f:
-        json.dump({"accounts": [account_info]}, f, indent=2)
+    accounts_file = save_account(
+        account_info,
+        credentials_path=credentials_path,
+        data_dir=data_dir,
+        save_to_project=save_to_project,
+        make_active=True,
+    )
 
-    print("Authorization completed and saved successfully!")
+    print(f"Authorization completed and saved successfully to {accounts_file}!")
+    return account_info
 
 
 class ModelsResource:
@@ -629,28 +1010,94 @@ class Client:
         api_key: str | None = None,
         project_id: str | None = None,
         base_url: str | None = None,
+        *,
+        refresh_token: str | None = None,
+        expires_at: float | None = None,
+        email: str | None = None,
+        account_email: str | None = None,
+        account_index: int | None = None,
+        credentials: dict[str, Any] | None = None,
+        credentials_path: str | os.PathLike[str] | None = None,
+        data_dir: str | os.PathLike[str] | None = None,
+        auto_save: bool = True,
     ):
         self.base_url = (
             base_url or os.environ.get("ANTI_API_BASE_URL") or API_ENDPOINTS["production"]
         ).rstrip("/")
-        self.api_key = api_key or os.environ.get("MY_API_KEY")
-        self.project_id = project_id
-        self.refresh_token = None
-        self.expires_at = None
+        self.credentials_path = str(credentials_path) if credentials_path is not None else None
+        self.data_dir = str(data_dir) if data_dir is not None else None
+        self.account_email = account_email or (
+            email if not api_key and not credentials and not refresh_token else None
+        )
+        self.account_index = account_index
+        self._auto_save = auto_save
+        self._account_index: int | None = None
         self.http_client = httpx.AsyncClient(timeout=60.0)
-        info = self._load_account_info()
-        if not self.api_key:
-            self.api_key = info.get("accessToken")
-        if not self.project_id:
-            self.project_id = (
-                os.environ.get("ANTI_PROJECT_ID") or info.get("projectId") or DEFAULT_PROJECT_ID
+
+        # Parse credentials dictionary if passed
+        creds_api_key = None
+        creds_refresh_token = None
+        creds_project_id = None
+        creds_email = None
+        creds_expires_at = None
+
+        if isinstance(credentials, dict):
+            creds_api_key = (
+                credentials.get("accessToken")
+                or credentials.get("access_token")
+                or credentials.get("apiKey")
+                or credentials.get("api_key")
             )
+            creds_refresh_token = credentials.get("refreshToken") or credentials.get(
+                "refresh_token"
+            )
+            creds_project_id = (
+                credentials.get("projectId")
+                or credentials.get("project_id")
+                or credentials.get("project")
+            )
+            creds_email = credentials.get("email")
+            creds_expires_at = credentials.get("expiresAt") or credentials.get("expires_at")
+
+        explicit_api_key = (
+            api_key
+            or creds_api_key
+            or os.environ.get("MY_API_KEY")
+            or os.environ.get("ANTI_API_KEY")
+        )
+
+        if explicit_api_key:
+            self.api_key = explicit_api_key
+            self.refresh_token = refresh_token or creds_refresh_token
+            self.expires_at = expires_at or creds_expires_at
+            self.email = email or creds_email
+            self.project_id = (
+                project_id
+                or creds_project_id
+                or os.environ.get("ANTI_PROJECT_ID")
+                or DEFAULT_PROJECT_ID
+            )
+        else:
+            info = self._load_account_info()
+            self.api_key = info.get("accessToken")
+            self.refresh_token = refresh_token or info.get("refreshToken")
+            self.expires_at = expires_at or info.get("expiresAt")
+            self.email = email or info.get("email")
+            self.project_id = (
+                project_id
+                or creds_project_id
+                or os.environ.get("ANTI_PROJECT_ID")
+                or info.get("projectId")
+                or DEFAULT_PROJECT_ID
+            )
+
         if not self.project_id or self.project_id == "unknown":
             self.project_id = DEFAULT_PROJECT_ID
-        self.refresh_token = info.get("refreshToken")
-        self.expires_at = info.get("expiresAt")
+
         if not self.api_key or self.api_key == "YOUR_ACCESS_TOKEN":
-            raise AuthError("API key not provided. Run anti_client.authenticate()")
+            raise AuthError(
+                "API key not provided. Run anti_client.authenticate() or pass api_key manually."
+            )
 
         self.models = ModelsResource(self)
         self.quota = QuotaResource(self)
@@ -664,6 +1111,38 @@ class Client:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         await self.close()
+
+    async def logout(self, revoke: bool = True) -> bool:
+        """Logs out the current client session, optionally revokes tokens with Google, and removes credentials from file.
+
+        Args:
+            revoke (bool): If True, attempts to revoke the OAuth token via Google OAuth2 endpoint. Defaults to True.
+
+        Returns:
+            bool: True if logged out successfully, False otherwise.
+        """
+        if revoke and (self.refresh_token or self.api_key):
+            token_to_revoke = self.refresh_token or self.api_key
+            try:
+                await self.http_client.post(
+                    "https://oauth2.googleapis.com/revoke",
+                    params={"token": token_to_revoke},
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=5.0,
+                )
+            except Exception:
+                pass
+
+        removed = remove_account(
+            email=self.email,
+            index=self._account_index,
+            credentials_path=self.credentials_path,
+            data_dir=self.data_dir,
+        )
+        self.api_key = None
+        self.refresh_token = None
+        self.expires_at = None
+        return removed
 
     async def get_user_info(self) -> dict:
         """Retrieves user profile information (email, name, picture) using the OAuth token.
@@ -683,7 +1162,12 @@ class Client:
         response = await self.http_client.get(url, headers=headers)
         if response.status_code != 200:
             self._raise_for_status(response.status_code, response.text)
-        return response.json()
+        user_data = response.json()
+        if isinstance(user_data, dict) and user_data.get("email"):
+            if not self.email or self.email != user_data["email"]:
+                self.email = user_data["email"]
+                self._save_account_info()
+        return user_data
 
     async def onboard_user(self, tier_id: str = "free-tier") -> dict:
         """Onboards the user and provisions a companion project if not already allocated.
@@ -1852,27 +2336,80 @@ class Client:
         return self._async_lock
 
     def _save_account_info(self) -> None:
-        """Saves account information to ~/.anti-api/accounts.json."""
-        data_dir = os.environ.get("ANTI_API_DATA_DIR")
-        if not data_dir:
-            home = (
-                os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
-            )
-            data_dir = os.path.join(home, ".anti-api")
-        accounts_file = os.path.join(data_dir, "accounts.json")
-        account_info = self._load_account_info()
-        account_info.update(
-            {
-                "accessToken": self.api_key,
-                "refreshToken": self.refresh_token,
-                "projectId": self.project_id,
-                "expiresAt": self.expires_at,
-            }
+        """Saves account information to credentials file without overwriting other accounts."""
+        if not getattr(self, "_auto_save", True):
+            return
+
+        account_info: dict[str, Any] = {
+            "accessToken": self.api_key,
+            "projectId": self.project_id,
+        }
+        if self.refresh_token is not None:
+            account_info["refreshToken"] = self.refresh_token
+        if self.expires_at is not None:
+            account_info["expiresAt"] = self.expires_at
+        if self.email is not None:
+            account_info["email"] = self.email
+
+        accounts_file = resolve_accounts_path(
+            credentials_path=getattr(self, "credentials_path", None),
+            data_dir=getattr(self, "data_dir", None),
+            for_saving=True,
         )
-        os.makedirs(data_dir, exist_ok=True)
+
+        accounts: list[dict[str, Any]] = []
+        active_account = None
+
+        if os.path.exists(accounts_file):
+            try:
+                with open(accounts_file, encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        raw_accounts = data.get("accounts", [])
+                        if isinstance(raw_accounts, list):
+                            accounts = [acc for acc in raw_accounts if isinstance(acc, dict)]
+                        active_account = data.get("activeAccount")
+            except Exception:
+                accounts = []
+
+        target_idx = -1
+        if (
+            getattr(self, "_account_index", None) is not None
+            and 0 <= self._account_index < len(accounts)
+        ):
+            target_idx = self._account_index
+        elif self.email:
+            for idx, acc in enumerate(accounts):
+                if acc.get("email", "").lower() == self.email.lower():
+                    target_idx = idx
+                    break
+        elif self.refresh_token:
+            for idx, acc in enumerate(accounts):
+                if acc.get("refreshToken") == self.refresh_token:
+                    target_idx = idx
+                    break
+
+        if target_idx >= 0:
+            entry = accounts[target_idx]
+            if not self.email and "email" in entry:
+                account_info["email"] = entry["email"]
+                self.email = entry["email"]
+            entry.update(account_info)
+            accounts[target_idx] = entry
+        else:
+            accounts.append(account_info)
+            self._account_index = len(accounts) - 1
+
+        payload: dict[str, Any] = {"accounts": accounts}
+        if self.email:
+            payload["activeAccount"] = self.email
+        elif active_account:
+            payload["activeAccount"] = active_account
+
+        os.makedirs(os.path.dirname(accounts_file), exist_ok=True)
         try:
             with open(accounts_file, "w", encoding="utf-8") as f:
-                json.dump({"accounts": [account_info]}, f, indent=2)
+                json.dump(payload, f, indent=2)
         except Exception:
             pass
 
@@ -1909,26 +2446,78 @@ class Client:
                     self.api_key = tokens.get("access_token")
                     expires_in = tokens.get("expires_in", 3600)
                     self.expires_at = time.time() + expires_in
+                    if "refresh_token" in tokens:
+                        self.refresh_token = tokens["refresh_token"]
                     self._save_account_info()
             except Exception:
                 pass
 
-    def _load_account_info(self) -> dict:
+    def _load_account_info(self) -> dict[str, Any]:
         """Loads account information from local cache file."""
-        data_dir = os.environ.get("ANTI_API_DATA_DIR")
-        if not data_dir:
-            home = (
-                os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
-            )
-            data_dir = os.path.join(home, ".anti-api")
-        accounts_file = os.path.join(data_dir, "accounts.json")
+        credentials_path = getattr(self, "credentials_path", None)
+        data_dir = getattr(self, "data_dir", None)
+        account_email = getattr(self, "account_email", None) or os.environ.get("ANTI_ACCOUNT_EMAIL")
+        account_index = getattr(self, "account_index", None)
+        if account_index is None and "ANTI_ACCOUNT_INDEX" in os.environ:
+            try:
+                account_index = int(os.environ["ANTI_ACCOUNT_INDEX"])
+            except ValueError:
+                account_index = None
+
+        accounts_file = resolve_accounts_path(
+            credentials_path=credentials_path,
+            data_dir=data_dir,
+            for_saving=False,
+        )
         if os.path.exists(accounts_file):
             try:
                 with open(accounts_file, encoding="utf-8") as f:
                     data = json.load(f)
-                    accounts = data.get("accounts", [])
-                    if accounts:
-                        return accounts[0]
+                    if isinstance(data, dict):
+                        accounts = data.get("accounts", [])
+                        if isinstance(accounts, list) and accounts:
+                            # 1. Select by account_email if provided
+                            if account_email:
+                                for idx, acc in enumerate(accounts):
+                                    if (
+                                        isinstance(acc, dict)
+                                        and acc.get("email", "").lower() == account_email.lower()
+                                    ):
+                                        self._account_index = idx
+                                        return acc
+                                raise AuthError(
+                                    f"Account with email '{account_email}' not found in {accounts_file}"
+                                )
+
+                            # 2. Select by account_index if provided
+                            if account_index is not None:
+                                if 0 <= account_index < len(accounts) and isinstance(
+                                    accounts[account_index], dict
+                                ):
+                                    self._account_index = account_index
+                                    return accounts[account_index]
+                                raise AuthError(
+                                    f"Account index {account_index} out of range in {accounts_file} ({len(accounts)} accounts available)"
+                                )
+
+                            # 3. Select activeAccount if present
+                            active_email = data.get("activeAccount")
+                            if active_email:
+                                for idx, acc in enumerate(accounts):
+                                    if (
+                                        isinstance(acc, dict)
+                                        and acc.get("email", "").lower() == str(active_email).lower()
+                                    ):
+                                        self._account_index = idx
+                                        return acc
+
+                            # 4. Default to first valid dict in accounts
+                            for idx, acc in enumerate(accounts):
+                                if isinstance(acc, dict):
+                                    self._account_index = idx
+                                    return acc
+            except AuthError:
+                raise
             except Exception:
                 pass
         return {}
