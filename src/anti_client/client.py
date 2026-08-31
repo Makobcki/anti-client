@@ -864,6 +864,27 @@ class ModelsResource:
             raw_display_name = info.get("displayName", name)
             clean_display_name = get_clean_display_name(raw_display_name)
 
+            raw_thinking_budget = info.get("thinkingBudget")
+            thinking_budget = (
+                raw_thinking_budget
+                if raw_thinking_budget is not None and raw_thinking_budget >= 0
+                else None
+            )
+
+            raw_min_thinking_budget = info.get("minThinkingBudget")
+            min_thinking_budget = (
+                raw_min_thinking_budget
+                if raw_min_thinking_budget is not None and raw_min_thinking_budget >= 0
+                else None
+            )
+
+            raw_max_output_tokens = info.get("maxOutputTokens")
+            max_output_tokens = (
+                raw_max_output_tokens
+                if raw_max_output_tokens is not None and raw_max_output_tokens >= 0
+                else None
+            )
+
             parsed_models.append(
                 ModelInfo(
                     id=name,
@@ -873,15 +894,15 @@ class ModelsResource:
                     api_provider=info.get("apiProvider", ""),
                     model_provider=info.get("modelProvider", ""),
                     max_tokens=info.get("maxTokens", 0),
-                    max_output_tokens=info.get("maxOutputTokens"),
+                    max_output_tokens=max_output_tokens,
                     is_internal=bool(info.get("isInternal", False)),
                     supports_images=bool(info.get("supportsImages", False)),
                     supports_video=bool(info.get("supportsVideo", False)),
                     supports_thinking=supports_thinking,
                     supported_efforts=supported_efforts,
                     thinking_level=effort_suffix,
-                    thinking_budget=info.get("thinkingBudget"),
-                    min_thinking_budget=info.get("minThinkingBudget"),
+                    thinking_budget=thinking_budget,
+                    min_thinking_budget=min_thinking_budget,
                     quota_info=quota_info,
                     recommended=bool(info.get("recommended", False)),
                     tag_title=info.get("tagTitle"),
@@ -1163,10 +1184,13 @@ class Client:
         if response.status_code != 200:
             self._raise_for_status(response.status_code, response.text)
         user_data = response.json()
-        if isinstance(user_data, dict) and user_data.get("email"):
-            if not self.email or self.email != user_data["email"]:
-                self.email = user_data["email"]
-                self._save_account_info()
+        if (
+            isinstance(user_data, dict)
+            and user_data.get("email")
+            and (not self.email or self.email != user_data["email"])
+        ):
+            self.email = user_data["email"]
+            self._save_account_info()
         return user_data
 
     async def onboard_user(self, tier_id: str = "free-tier") -> dict:
@@ -1345,7 +1369,10 @@ class Client:
 
                 parts = []
                 if m.thought:
-                    parts.append({"thought": m.thought})
+                    thought_part: dict[str, Any] = {"text": m.thought, "thought": True}
+                    if getattr(m, "thought_signature", None):
+                        thought_part["thoughtSignature"] = m.thought_signature
+                    parts.append(thought_part)
                 if m.content:
                     parts.append({"text": m.content})
                 if m.attachments:
@@ -1360,14 +1387,22 @@ class Client:
                         )
                 if m.tool_calls:
                     for tc in m.tool_calls:
-                        parts.append(
-                            {
-                                "functionCall": {
-                                    "name": tc.name,
-                                    "args": tc.arguments,
-                                }
-                            }
+                        tc_name = tc.get("name") if isinstance(tc, dict) else tc.name
+                        tc_args = tc.get("arguments") if isinstance(tc, dict) else tc.arguments
+                        tc_sig = (
+                            (tc.get("thought_signature") or tc.get("thoughtSignature"))
+                            if isinstance(tc, dict)
+                            else getattr(tc, "thought_signature", None)
                         )
+                        part_dict: dict[str, Any] = {
+                            "functionCall": {
+                                "name": tc_name,
+                                "args": tc_args,
+                            }
+                        }
+                        if tc_sig:
+                            part_dict["thoughtSignature"] = tc_sig
+                        parts.append(part_dict)
                 if m.role == "tool":
                     parts.append(
                         {
@@ -1684,8 +1719,10 @@ class Client:
 
         # Validate max_output_tokens
         if (
-            max_output_tokens
-            and model_info.max_output_tokens
+            max_output_tokens is not None
+            and max_output_tokens >= 0
+            and model_info.max_output_tokens is not None
+            and model_info.max_output_tokens >= 0
             and max_output_tokens > model_info.max_output_tokens
         ):
             raise ValueError(
@@ -1693,17 +1730,26 @@ class Client:
             )
 
         # Validate thinking limits
-        if thinking_budget:
+        if thinking_budget is not None:
             if not model_info.supports_thinking:
                 raise ValueError(f"Model '{model}' does not support reasoning/thinking.")
-            if model_info.min_thinking_budget and thinking_budget < model_info.min_thinking_budget:
-                raise ValueError(
-                    f"thinking_budget ({thinking_budget}) is below model minimum ({model_info.min_thinking_budget})."
-                )
-            if model_info.thinking_budget and thinking_budget > model_info.thinking_budget:
-                raise ValueError(
-                    f"thinking_budget ({thinking_budget}) exceeds model maximum ({model_info.thinking_budget})."
-                )
+            if thinking_budget >= 0:
+                if (
+                    model_info.min_thinking_budget is not None
+                    and model_info.min_thinking_budget >= 0
+                    and thinking_budget < model_info.min_thinking_budget
+                ):
+                    raise ValueError(
+                        f"thinking_budget ({thinking_budget}) is below model minimum ({model_info.min_thinking_budget})."
+                    )
+                if (
+                    model_info.thinking_budget is not None
+                    and model_info.thinking_budget >= 0
+                    and thinking_budget > model_info.thinking_budget
+                ):
+                    raise ValueError(
+                        f"thinking_budget ({thinking_budget}) exceeds model maximum ({model_info.thinking_budget})."
+                    )
 
     @overload
     async def generate(
@@ -1837,21 +1883,32 @@ class Client:
                             }
                         }
                     )
+            if msg.thought:
+                thought_part: dict[str, Any] = {"text": msg.thought, "thought": True}
+                if getattr(msg, "thought_signature", None):
+                    thought_part["thoughtSignature"] = msg.thought_signature
+                parts.append(thought_part)
             if msg.content:
                 parts.append({"text": msg.content})
-            if msg.thought:
-                parts.append({"thought": msg.thought})
             if msg.tool_calls:
                 for tc in msg.tool_calls:
-                    part_dict = {
+                    tc_id = tc.get("id") if isinstance(tc, dict) else tc.id
+                    tc_name = tc.get("name") if isinstance(tc, dict) else tc.name
+                    tc_args = tc.get("arguments") if isinstance(tc, dict) else tc.arguments
+                    tc_sig = (
+                        (tc.get("thought_signature") or tc.get("thoughtSignature"))
+                        if isinstance(tc, dict)
+                        else getattr(tc, "thought_signature", None)
+                    )
+                    part_dict: dict[str, Any] = {
                         "functionCall": {
-                            "id": tc.id,
-                            "name": tc.name,
-                            "args": tc.arguments,
+                            "id": tc_id,
+                            "name": tc_name,
+                            "args": tc_args,
                         }
                     }
-                    if tc.thought_signature:
-                        part_dict["thoughtSignature"] = tc.thought_signature
+                    if tc_sig:
+                        part_dict["thoughtSignature"] = tc_sig
                     parts.append(part_dict)
             if msg.role == "tool":
                 try:
@@ -1887,10 +1944,14 @@ class Client:
             if isinstance(kwargs.get("thinking_config"), dict):
                 thinking_config = kwargs["thinking_config"]
             elif "claude" in model.lower():
-                budget = thinking_budget or (
-                    1024
-                    if thinking_level == "low"
-                    else (16384 if thinking_level == "high" else 4096)
+                budget = (
+                    thinking_budget
+                    if (thinking_budget is not None and thinking_budget > 0)
+                    else (
+                        1024
+                        if thinking_level == "low"
+                        else (16384 if thinking_level == "high" else 4096)
+                    )
                 )
                 if budget >= max_output_tokens:
                     budget = max(1024, max_output_tokens - 1024)
@@ -1905,6 +1966,8 @@ class Client:
                     "includeThoughts": True,
                     "thinkingLevel": thinking_level or "high",
                 }
+                if thinking_budget is not None:
+                    thinking_config["thinkingBudget"] = thinking_budget
 
         generation_config: dict[str, Any] = {
             "temperature": temperature,

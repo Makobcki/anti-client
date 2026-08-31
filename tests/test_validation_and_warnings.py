@@ -153,6 +153,51 @@ def test_thinking_budget_validation(sample_catalog):
             thinking_budget=10000,  # max is 4000
         )
 
+    # Thinking budget = -1 (unlimited) is valid for models supporting thinking
+    client._validate_request_params(
+        model="gemini-2.5-flash",
+        catalog=sample_catalog,
+        messages=[msg],
+        max_output_tokens=1024,
+        thinking_budget=-1,
+    )
+
+    # Thinking budget = -1 raises error for models not supporting thinking
+    with pytest.raises(ValueError, match="does not support reasoning/thinking"):
+        client._validate_request_params(
+            model="text-only-model",
+            catalog=sample_catalog,
+            messages=[msg],
+            max_output_tokens=1024,
+            thinking_budget=-1,
+        )
+
+    # Model with thinking_budget=None (unconstrained) accepts any positive budget
+    unconstrained_model = ModelInfo(
+        id="gemini-unconstrained",
+        display_name="Gemini Unconstrained",
+        clean_display_name="Gemini Unconstrained",
+        internal_model_id="M_UNCONSTRAINED",
+        model_provider="MODEL_PROVIDER_GOOGLE",
+        api_provider="API_PROVIDER_GOOGLE_GEMINI",
+        max_tokens=1048576,
+        max_output_tokens=None,
+        supports_thinking=True,
+        thinking_budget=None,
+        min_thinking_budget=None,
+    )
+    unconstrained_catalog = ModelsCatalog(
+        models=[unconstrained_model],
+        default_agent_model_id="gemini-unconstrained",
+    )
+    client._validate_request_params(
+        model="gemini-unconstrained",
+        catalog=unconstrained_catalog,
+        messages=[msg],
+        max_output_tokens=65536,
+        thinking_budget=32768,
+    )
+
 
 def test_deprecated_model_warning(sample_catalog):
     client = Client(api_key="dummy_key", project_id="dummy_proj")

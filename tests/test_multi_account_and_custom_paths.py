@@ -1,14 +1,13 @@
 import json
 import os
 import tempfile
-import time
 from unittest.mock import AsyncMock, patch
+
 import httpx
 import pytest
 
 from anti_client.client import (
     Client,
-    authenticate,
     get_account,
     list_accounts,
     logout,

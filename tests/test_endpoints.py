@@ -98,6 +98,41 @@ async def test_fetch_available_models_catalog():
 
 
 @pytest.mark.asyncio
+async def test_fetch_catalog_unlimited_thinking_budget():
+    mock_resp = httpx.Response(
+        status_code=200,
+        json={
+            "models": {
+                "gemini-3.7-flash": {
+                    "model": "MODEL_GEMINI_37_FLASH",
+                    "displayName": "Gemini 3.7 Flash",
+                    "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                    "modelProvider": "MODEL_PROVIDER_GOOGLE",
+                    "maxTokens": 1048576,
+                    "maxOutputTokens": -1,
+                    "supportsImages": True,
+                    "supportsThinking": True,
+                    "thinkingBudget": -1,
+                    "minThinkingBudget": -1,
+                }
+            },
+            "defaultAgentModelId": "gemini-3.7-flash",
+        },
+    )
+
+    client = Client(api_key="test_token", project_id="aicode-consumers")
+    with patch.object(client.http_client, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        catalog = await client.models.get_catalog()
+
+        m = catalog.get_model("gemini-3.7-flash")
+        assert m is not None
+        assert m.thinking_budget is None
+        assert m.min_thinking_budget is None
+        assert m.max_output_tokens is None
+
+
+@pytest.mark.asyncio
 async def test_retrieve_user_quota_summary():
     mock_resp = httpx.Response(
         status_code=200,
@@ -216,3 +251,74 @@ async def test_count_tokens_with_messages_tools_and_system():
         parts = req["contents"][0]["parts"]
         assert parts[0]["text"] == "Describe this image"
         assert parts[1]["inlineData"]["mimeType"] == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_thought_parts_serialization_in_payload_and_count_tokens():
+    recorded_requests = []
+    mock_resp = httpx.Response(status_code=200, json={"totalTokens": 64})
+    client = Client(api_key="test_token", project_id="aicode-consumers")
+
+    async def mock_post(url, json_data, headers, **kwargs):
+        recorded_requests.append((url, json_data))
+        return mock_resp
+
+    with patch.object(client, "_post_with_fallback", side_effect=mock_post):
+        msg = Message(
+            role="assistant",
+            content="Final answer",
+            thought="Thinking about solution...",
+            thought_signature="sig_12345",
+        )
+        await client.count_tokens(messages=[msg])
+
+        count_reqs = [r for r in recorded_requests if "countTokens" in r[0]]
+        assert len(count_reqs) == 1
+        url, body = count_reqs[0]
+        contents = body["request"]["contents"]
+        assert len(contents) == 1
+        parts = contents[0]["parts"]
+        # Thought part must be first and contain text and thought: True (TYPE_BOOL)
+        assert parts[0]["text"] == "Thinking about solution..."
+        assert parts[0]["thought"] is True
+        assert parts[0]["thoughtSignature"] == "sig_12345"
+        # Content part must follow
+        assert parts[1]["text"] == "Final answer"
+
+    # Test generate payload
+    gen_mock_resp = httpx.Response(
+        status_code=200,
+        text='data: {"response": {"candidates": [{"content": {"parts": [{"text": "World"}]}}]}}\n\n',
+    )
+    gen_requests = []
+
+    async def mock_gen_post(url, json_data, headers, **kwargs):
+        gen_requests.append((url, json_data))
+        return gen_mock_resp
+
+    with patch.object(client, "_post_with_fallback", side_effect=mock_gen_post):
+        await client.generate(
+            model="gemini-3.1-pro-low",
+            messages=[
+                Message(role="user", content="Hi"),
+                Message(
+                    role="assistant",
+                    content="Hello!",
+                    thought="Thinking...",
+                    thought_signature="sig_abc",
+                ),
+            ],
+        )
+
+        gen_reqs = [r for r in gen_requests if "streamGenerateContent" in r[0]]
+        assert len(gen_reqs) == 1
+        url, body = gen_reqs[0]
+        req_contents = body["request"]["contents"]
+        assert len(req_contents) == 2
+        model_turn_parts = req_contents[1]["parts"]
+        assert model_turn_parts[0]["text"] == "Thinking..."
+        assert model_turn_parts[0]["thought"] is True
+        assert model_turn_parts[0]["thoughtSignature"] == "sig_abc"
+        assert model_turn_parts[1]["text"] == "Hello!"
+
+
